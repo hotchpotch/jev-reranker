@@ -1,11 +1,14 @@
-"""Loop ownership and a persistent bridge for the synchronous API."""
+"""Per-call HTTP ownership with no persistent synchronous event loop."""
 
 from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Callable, Coroutine
+from concurrent.futures import Future
 from contextlib import asynccontextmanager
-from threading import Lock, Thread
+from contextvars import ContextVar
+from dataclasses import dataclass
+from threading import Condition, Lock
 from typing import Any, TypeVar
 
 import httpx
@@ -20,43 +23,68 @@ def require_sync_context() -> None:
         asyncio.get_running_loop()
     except RuntimeError:
         return
-    raise ConfigurationError(
-        "Use await a_rank()/a_raw_rank() and aclose() inside an async event loop."
-    )
+    raise ConfigurationError("Use await a_rerank()/a_relevance_rerank() inside an async event loop.")
 
 
-class _LoopThread:
-    def __init__(self) -> None:
-        self.loop = asyncio.new_event_loop()
-        self.thread = Thread(target=self._run, name="jev-reranker-asyncio", daemon=True)
-        self.thread.start()
+class _BorrowedTransport(httpx.AsyncBaseTransport):
+    """Closing a per-call client must not close a caller-supplied transport."""
 
-    def _run(self) -> None:
-        asyncio.set_event_loop(self.loop)
+    def __init__(self, transport: httpx.AsyncBaseTransport) -> None:
+        self.transport = transport
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        return await self.transport.handle_async_request(request)
+
+
+class _Limiter:
+    """A cancellation-safe limit shared across caller threads and event loops."""
+
+    def __init__(self, count: int) -> None:
+        self.available = count
+        self.lock = Lock()
+        self.waiters: list[Future[None]] = []
+
+    async def __aenter__(self) -> None:
+        waiter: Future[None] = Future()
+        with self.lock:
+            if self.available:
+                self.available -= 1
+                return
+            self.waiters.append(waiter)
         try:
-            self.loop.run_forever()
-        finally:
-            pending = asyncio.all_tasks(self.loop)
-            for task in pending:
-                task.cancel()
-            if pending:
-                self.loop.run_until_complete(
-                    asyncio.gather(*pending, return_exceptions=True)
-                )
-            self.loop.run_until_complete(self.loop.shutdown_asyncgens())
-            self.loop.run_until_complete(self.loop.shutdown_default_executor())
-            self.loop.close()
+            await asyncio.wrap_future(waiter)
+        except BaseException:
+            with self.lock:
+                if waiter in self.waiters:
+                    self.waiters.remove(waiter)
+                else:
+                    self._release()
+            raise
 
-    def stop(self) -> None:
-        self.loop.call_soon_threadsafe(self.loop.stop)
-        self.thread.join()
+    def _release(self) -> None:
+        if self.waiters:
+            waiter = self.waiters.pop(0)
+            # Cancellation is reconciled by the acquire handler under this lock.
+            if waiter.set_running_or_notify_cancel():
+                waiter.set_result(None)
+        else:
+            self.available += 1
+
+    async def __aexit__(self, *exc: object) -> None:
+        with self.lock:
+            self._release()
+
+
+@dataclass
+class _Operation:
+    client: httpx.AsyncClient | None = None
 
 
 class Runtime:
-    """One instance owns one loop and one HTTP pool; no cross-loop resources.
+    """Create and close owned HTTP clients within each ranking operation.
 
-    Native async calls bind to their first caller's loop. Sync calls instead
-    start one loop thread, shared by all calling threads until close().
+    Explicit clients and transports remain caller-owned. Only borrowed clients
+    bind to a loop; ordinary instances can be reused across sync and async calls.
     """
 
     def __init__(
@@ -68,125 +96,98 @@ class Runtime:
         self.concurrency = concurrency
         self.client = client
         self.transport = transport
-        self.owns_client = client is None
         self.loop: asyncio.AbstractEventLoop | None = None
-        self.runner: _LoopThread | None = None
         self.closed = False
         self.closing = False
-        self._guard = Lock()
-        self._sync_close_guard = Lock()
-        self._semaphore: asyncio.Semaphore | None = None
-        self._idle: asyncio.Event | None = None
+        self._condition = Condition()
         self._active = 0
-        self._close_task: asyncio.Task[None] | None = None
+        self._close_complete: Future[None] = Future()
+        self.semaphore = _Limiter(concurrency)
+        self._operation: ContextVar[_Operation] = ContextVar("jev_operation")
 
-    def bind(self, *, allow_closing: bool = False) -> None:
-        current = asyncio.get_running_loop()
-        with self._guard:
-            if self.closed or (self.closing and not allow_closing):
+    def bind(self) -> None:
+        with self._condition:
+            if self.closed or self.closing:
                 raise ConfigurationError("JevReranker is closed or closing.")
-            if self.loop is not None and self.loop is not current:
-                raise ConfigurationError(
-                    "JevReranker belongs to a different event loop; use a separate instance."
-                )
-            self.loop = current
-            if self._semaphore is None:
-                self._semaphore = asyncio.Semaphore(self.concurrency)
-                self._idle = asyncio.Event()
-                self._idle.set()
+            if self.client is not None:
+                current = asyncio.get_running_loop()
+                if self.loop is not None and self.loop is not current:
+                    raise ConfigurationError("Borrowed HTTP client belongs to a different event loop.")
+                self.loop = current
 
     @asynccontextmanager
     async def operation(self) -> AsyncIterator[None]:
-        self.bind()
-        assert self._idle is not None
-        self._active += 1
-        self._idle.clear()
+        with self._condition:
+            self.bind()
+            self._active += 1
+        state = _Operation()
+        token = self._operation.set(state)
         try:
             yield
         finally:
-            self._active -= 1
-            if not self._active:
-                self._idle.set()
-
-    @property
-    def semaphore(self) -> asyncio.Semaphore:
-        assert self._semaphore is not None
-        return self._semaphore
+            try:
+                if state.client is not None and self.client is None:
+                    cleanup = asyncio.create_task(state.client.aclose())
+                    cancelled = False
+                    while not cleanup.done():
+                        try:
+                            await asyncio.shield(cleanup)
+                        except asyncio.CancelledError:
+                            cancelled = True
+                    cleanup.result()
+                    if cancelled:
+                        raise asyncio.CancelledError
+            finally:
+                self._operation.reset(token)
+                with self._condition:
+                    self._active -= 1
+                    if not self._active:
+                        if self.closing:
+                            self._mark_closed()
+                        self._condition.notify_all()
 
     def get_client(self) -> httpx.AsyncClient:
-        # Called only within an operation on the owning loop.
-        if self.client is None:
-            self.client = httpx.AsyncClient(
-                transport=self.transport,
+        state = self._operation.get()
+        if state.client is None:
+            state.client = self.client or httpx.AsyncClient(
+                transport=_BorrowedTransport(self.transport) if self.transport else None,
                 limits=httpx.Limits(
                     max_connections=self.concurrency,
                     max_keepalive_connections=self.concurrency,
                 ),
             )
-        if self.client.is_closed:
+        if state.client.is_closed:
             raise ConfigurationError("HTTP client is closed.")
-        return self.client
+        return state.client
 
     def run(self, factory: Callable[[], Coroutine[Any, Any, T]]) -> T:
         require_sync_context()
-        with self._guard:
-            if self.closed or self.closing:
-                raise ConfigurationError("JevReranker is closed or closing.")
-            if self.runner is None:
-                if self.loop is not None:
-                    raise ConfigurationError(
-                        "This instance uses an async event loop; use its async methods."
-                    )
-                self.runner = _LoopThread()
-                self.loop = self.runner.loop
-            future = asyncio.run_coroutine_threadsafe(factory(), self.runner.loop)
-        try:
-            return future.result()
-        except BaseException:
-            future.cancel()
-            raise
+        if self.client is not None:
+            raise ConfigurationError("Use async methods with a borrowed AsyncClient.")
+        return asyncio.run(factory())
+
+    def _mark_closed(self) -> None:
+        # Called under the condition lock once all operations have drained.
+        if not self.closed:
+            self.closed = True
+            self._close_complete.set_result(None)
+
+    def _finish_close(self) -> None:
+        with self._condition:
+            self.closing = True
+            self._condition.wait_for(lambda: self._active == 0)
+            self._mark_closed()
 
     async def aclose(self) -> None:
-        if self.closed:
-            return
-        self.bind(allow_closing=True)
-        if self._close_task is None:
+        # Compatibility API: mark closed and drain calls, with no owned idle pool.
+        with self._condition:
             self.closing = True
-            self._close_task = asyncio.create_task(self._finish_close())
-        # Cancelling a waiter must not interrupt HTTP pool cleanup.
-        await asyncio.shield(self._close_task)
-
-    async def _finish_close(self) -> None:
-        assert self._idle is not None
-        await self._idle.wait()
-        try:
-            if self.owns_client and self.client is not None:
-                await self.client.aclose()
-            elif self.owns_client and self.transport is not None:
-                await self.transport.aclose()
-        finally:
-            self.closed = True
+            if not self._active:
+                self._mark_closed()
+        # Share completion across loops without occupying an executor worker.
+        # Cancelling one waiter must not cancel the shared shutdown signal.
+        await asyncio.shield(asyncio.wrap_future(self._close_complete))
 
     def close(self) -> None:
         require_sync_context()
-        with self._sync_close_guard:
-            with self._guard:
-                if self.closed:
-                    return
-                if self.runner is None:
-                    if self.loop is not None:
-                        raise ConfigurationError(
-                            "Use await aclose() on the owning async event loop."
-                        )
-                    if self.transport is None:
-                        self.closed = True
-                        return
-                    self.runner = _LoopThread()
-                    self.loop = self.runner.loop
-                self.closing = True
-                runner = self.runner
-                future = asyncio.run_coroutine_threadsafe(self.aclose(), runner.loop)
-            try:
-                future.result()
-            finally:
-                runner.stop()
+        self._finish_close()

@@ -1,80 +1,146 @@
-# Jev reranker 仕様
+# Design and behavior
 
-## 目的と公開 API
+## Purpose and public API
 
-HAKARI の `TypeSafeRerankerAdapter` を、評価基盤・GPU・NumPy に依存しない Python 3.11+ ライブラリへ移植する。初期公開済みの 0.0.1 は scaffolding のみであり、本仕様は次回リリース向けの実装を扱う。
+This document describes the library's scoring contracts, resource ownership, and
+failure behavior. Start with the [README](../README.md) for installation and usage.
 
-`JevReranker(...).rank(query, documents, **kwargs)` と `rerank(...)` は同じ API。ともに `raw_rerank(...)` の `results` を返す薄い wrapper とする。入力は query 文字列と文書文字列の sequence。結果は `document_index`（入力の0始まり index）、`score`、既定で元の `text` を持つ辞書のリストで、スコア降順、同点は入力順。重複文書も別の候補として保持する。`top_k=None` は全件、0 は空、正整数は上位件数。top_k は出力のみを制限し、採点対象を削らない。`return_documents=False` で本文を省略する。
+The library separates two retrieval decisions: ordering candidates and selecting
+evidence for an answer. Both use Jev with different instructions and share the
+same request pipeline. The design draws on HAKARI-Bench's TypeSafe reranker while
+remaining independent of its evaluation framework and local model dependencies.
 
-`raw_rerank(..., detail=True)` は JSON 化可能な `results` と `detail` を返す。各 result にも文書別 detail を付与する。raw は HTTP 応答そのものではなく、複数リクエストを統合した実行記録。`detail=False` では detail を保存しない。入力不正・不明な kwargs は API 呼び出し前に例外とし、黙って無視しない。非同期の `a_rank()` / `a_raw_rank()` を中心として、同期 wrapper と両方の context manager を提供する。`a_rerank()` / `a_raw_rerank()`、同期 `raw_rank()` は命名互換用 alias。呼び出し単位の統計を分離し、同時実行でも他の呼び出しの情報を混ぜない。
+`JevReranker(...).rerank(query, documents, **kwargs)` returns a dictionary: `{"results": [...]}` with an optional top-level `detail`. This structure also applies to `relevance_rerank()` and all async equivalents. Inputs are a query string and a sequence of document strings. Results contain `document_index` (zero-based input position), `score`, and, by default, the original `text`. Sort by descending score and preserve input order for ties. Keep duplicate documents as independent candidates. `top_k=None` returns all eligible results, zero returns none, and a positive integer limits the output without reducing the scored candidates. `return_documents=False` omits text.
 
-## asyncio 実行とライフサイクル
+`rerank(..., detail=True)` returns JSON-serializable results and execution details, including per-document details on each result. It combines multiple requests rather than returning an unmodified HTTP response. With `detail=False`, details are not retained. Invalid inputs and unknown kwargs fail before API calls. Provide synchronous wrappers and both context-manager forms around `a_rerank()` / `a_relevance_rerank()`. The public ranking API consists of these two async methods and their synchronous counterparts. Isolate statistics for concurrent calls.
 
-HTTP 通信は `httpx.AsyncClient`、同時実行制限は `asyncio.Semaphore`、retry 待機は `asyncio.sleep` を使う。HTTP 呼び出しごとの ThreadPoolExecutor は作らない。既存 `rank/rerank/raw_rerank` は同じ async 実装を呼ぶ blocking wrapper とし、採点・分割・検証のロジックを重複させない。
+## Instructions and relevance filtering
 
-`await a_rank(query, documents, *, top_k=None, return_documents=True, detail=False)` は results リスト、`await a_raw_rank(...)` は results と全体 detail の辞書を返す。引数・同点順序・例外型は同期 API と共通。async API は `async with JevReranker(...)` または `await aclose()` で終了する。
+`instructions.py` exposes ordinary dictionary presets `RERANK_INSTRUCTION`, `PAIRWISE_INSTRUCTION`, `RELEVANCE_INSTRUCTION`, and `POINTWISE_RELEVANCE_INSTRUCTION`. Dictionaries contain only `instructions: str` and `criteria: {true: str, false: str}`. Reject metadata and unknown keys. Templates require `{document}` for ordinary scoring, or `{left}` and `{right}` for pairwise. Reject other placeholders, format specifiers, and conversions.
 
-instance は最初の async 利用時のイベントループに固定し、同じ AsyncClient/接続プール/Semaphore を再利用する。async instance を別ループで使う、または同期 API から使う場合は ConfigurationError。同期利用では instance ごとに1つの専用イベントループスレッドを遅延起動し、`run_coroutine_threadsafe` 経由で既存の複数スレッドから安全に共有する。同期 instance を別の async ループから使うことも拒否する。イベントループ内の同期メソッド呼び出しは実行前に拒否し、a_rank/a_raw_rank/aclose を案内する。
+Accept `instruction=` on the constructor and each call. Preserve legacy constructor `instructions` / `criteria`, but reject combining them with constructor `instruction`. Deep-copy validated instructions into each `_Run` and pass them through every chunk, retry, and pointwise task. Do not mutate shared instance settings. Record the effective prompt in details.
 
-HTTP client は初回 request 時に作る。空入力や top_k=0 は HTTP client や tokenizer をロードしない。同期 API の loop は繰り返し呼び出しても作り直さず close 時に停止する。明示 `client` は httpx.AsyncClient のみを受け入れて所有権を移さない。`transport` は AsyncBaseTransport を受け入れて所有し、request 未実行でも終了時に閉じる。両方の同時指定は拒否する。外部 client は呼び出し側が同じループで管理する。
+`relevance_rerank` selects `RELEVANCE_INSTRUCTION` for listwise and `POINTWISE_RELEVANCE_INSTRUCTION` for pointwise, then passes that preset and default `threshold=0.2` through `rerank`. The async path is `a_relevance_rerank` → `a_rerank`. Reuse scoring, partitioning, and error handling; do not provide a separate relevance HTTP implementation or `relevance_filter` method. A per-call instruction overrides the relevance preset. Relevance evaluates absolute usefulness as evidence and supports listwise/pointwise; pairwise's relative win probability raises `ConfigurationError` here.
 
-pointwise は最大 max_concurrency 個の worker task が入力を順に取り出し、pairwise は最大 max_concurrency ペアずつ処理する。大量候補から無制限の task を作らない。共有 Semaphore による上限は同一 instance の全 query に効き、retry 待機中も request 枠を占有する。listwise の分割 chunk は引き続き逐次処理する。Tokenizer の遅延ロード・前処理・計数は同期処理なので asyncio.to_thread に退避し、tokenizer lock を維持する。
+Ordinary reranking methods default to `threshold=0.0`. Accept only finite numeric thresholds in [0, 1], excluding booleans. Select scored candidates satisfying `score >= threshold`, sort them stably, then apply `top_k`. Do not transform, round, or recalibrate scores. Thresholds change downstream output, not request contents, scored candidates, or billable work. Zero scores survive threshold zero. If all candidates are rejected, return `{"results": []}` and retain top-level execution details when `detail=True`. Empty input and `top_k=0` still make no requests.
 
-各呼び出しの統計は独立した _Run に記録する。HTTP 側の状態更新は所属ループで行い、await を挟まない小さな更新に mutex は使わない。キャンセル時は子タスクを cancel・回収してから CancelledError をそのまま伝える。失敗時も子タスクを回収し、公開 API の JevError を ExceptionGroup に変換しない。キャンセルした HTTP trace の status は cancelled とする（兄弟 request の失敗で返る例外 detail から確認できる）。
+The relevance preset credits direct answers, partial answers, concrete linking facts,
+and entity identification as useful evidence. The prompt lives in
+[`instructions.py`](../src/jev_reranker/instructions.py), which is the source of truth.
+The pointwise preset judges specific facts, entity disambiguation, and partial
+evidence using only the query and one document. It does not assume access to a
+partner document. Listwise remains the default; neither preset guarantees
+calibration or quality on a new task. Sync and async routing use the same presets.
 
-aclose/close 開始後は新しい採点を拒否し、実行中の採点を待ってから所有する client/transport を閉じる。aclose 待機側がキャンセルされても cleanup task は shield し、再度 aclose で終了を待てる。利用者は loop を閉じる前に aclose を完了させる。close は同期ブリッジのループ・補助スレッドも終了させる。設定は使用中に変更しない。
+Do not send evaluation labels or selection thresholds in the scoring payload.
+The default threshold is 0.2; validate it on representative queries. Complete
+positive retention and calibrated probabilities are not guaranteed. Partitioning
+and pointwise scoring change the shared context and can change usefulness scores.
 
-## 採点方式と存在理由
+Detail schema version 2 records `configuration.threshold`, every document's `score` and `passes_threshold` (independent of top-k selection), and `selection.top_k/scored_count/above_threshold_count/returned_count`. Use the top-level details from any ranking method to diagnose excluded documents, even when `results` is empty. Attach effective prompts and thresholds to `JevError` details for failures after input validation.
 
-- **listwise（既定）**: query と候補群を同じ state に含め、文書ごとに独立した Noul（回答に役立つ確率）を質問する。文書比較の文脈を共有し、query の重複送信を減らす。API が直接順列を返す意味ではない。候補が文脈上限に収まらなければ分割する。
-- **pointwise**: query と1文書の state ごとに Noul を採点する。他候補の追加・削除が質問の文脈を変えず、大きな候補集合でも評価しやすい。候補数ぶんリクエストと query の重複が生じる。
-- **pairwise**: 全ての非順序ペアについて「A は B より回答に役立つか」と逆方向を同じ state で質問する。A の勝率は `(p(A>B) + 1-p(B>A))/2`、B はその補数。各文書の平均勝率で順位を作る。位置バイアスの緩和と相対比較の実験用。O(n²) の質問・計算を要し、既定ではない。1文書は比較不要なので score=0.5。pairwise score は絶対的な関連確率ではなく、その候補集合での平均勝率である。
+## Async execution and lifecycle
 
-通常の関連判定は移植元と同じ英語の narrow question と true/false criteria を使う。日本語などの入力を翻訳せず JSON の query/documents として送る。`instructions` と `criteria` を constructor で差し替え可能。pointwise/listwise template は `{document}`、pairwise は `{left}` と `{right}` を必須とする。model は既定 `jev-latest`、固定バージョンも任意指定可能。
+Use `httpx.AsyncClient` and `asyncio` for HTTP and retries. Each reranking call
+owns a context-local operation state and lazily creates one HTTP client on its
+first request. Reuse that client for the call's chunks, workers, and retries.
+Close it before returning or raising, including cancellation; shield cleanup and
+wait for it even if the caller is cancelled again. Empty input and top_k=0 do not
+create a client or load a tokenizer. No connection pool survives an ordinary call.
 
-## 長さ計測、Tokenizer、長文、分割
+Synchronous methods use `asyncio.run()` per call with no persistent helper thread.
+The same instance can be used by multiple synchronous threads, by native async
+callers, or sequentially across different event loops. Reject sync methods inside
+a running event loop and direct callers to async methods. Async methods preserve
+the same arguments, results, tie ordering, and exception types as sync methods.
 
-既定は Python の `len(text)` による Unicode code point 数。tokenizer は optional とし、通常のインストールは httpx と python-dotenv のみを必要とする。`length_fn: Callable[[str], int]` で独自計測に差し替えられる。関数は決定的な非負整数を返し、bool や負数などの不正値・実行エラーは ConfigurationError。同期関数を worker thread で実行し、instance 内の計数 lock で保護する。文書と JSON 化した state/question/request に同じ方法を使う。tokenizer と length_fn の併用は拒否する。
+An instance-wide concurrency limiter coordinates requests across threads and loops
+using a lock and awaitable futures. Cancellation removes waiters or releases their
+assigned permits without leaking capacity. Retry waits retain their request slot.
+Pointwise uses bounded worker tasks; pairwise processes bounded groups of pairs.
+Listwise chunks run sequentially. Move tokenizer loading and counting to
+`asyncio.to_thread`, retaining the instance tokenizer lock.
 
-`tokenizer="google/embeddinggemma-300m"` で tokenizer.json を Hub から遅延取得し token 数で計測する。名前指定時は `jev-reranker[tokenizer]` 相当の extra（checkout では `.[tokenizer]`）を必要とする。任意の encode/decode オブジェクトも受け取れる。モデルの重みや PyTorch は不要。Gemma 利用条件の承諾と HF 認証が必要な場合は利用者の環境/キャッシュを使う。Gemma の既定 revision は `57c266a740f537b4dc058e1b0cda161fd15afa75` に固定。`split_tokenizer_revision="main"` で追従可能。別 Hub repo、ローカル tokenizer.json も指定可能。`split_tokenizer_name` は名前指定の別名。
+Injected `client` and `transport` are advanced, caller-owned resources and are
+never closed by the library. Reject specifying both. A borrowed AsyncClient
+requires native async methods and binds to the first event loop; callers must
+close it on that loop. A transport is wrapped so closing an operation's client
+does not close the shared transport. The caller is responsible for that transport's
+lifecycle and support for concurrent or cross-loop use.
 
-実環境では tokenizer を推奨する。特に英語では文字数が token 数より大きくなりやすく、文字基準は早すぎる切り詰め・分割につながる場合がある。ただし Gemma と Jev の内部 token 数は同一とは限らない。オブジェクト指定では model_max_length が tokenizer_max_length（既定65536）未満なら元オブジェクトの属性を自動で引き上げ、大きな既存値は維持する。属性がない独自 tokenizer は変更しない。必要な引き上げができない読み取り専用属性は ConfigurationError とする。名前指定の tokenizer の長さ設定は65536、truncation/padding は無効で、これを超えても全 token を数える。EmbeddingGemma 本体の embedding context を拡張する処理ではない。
+Each `_Run` keeps independent statistics. Cancellation and failure drain child
+tasks before closing the operation's client. Preserve `CancelledError` and public
+`JevError` exceptions rather than wrapping them in ExceptionGroup. Cancelled HTTP
+traces retain status `cancelled` for diagnostics.
 
-`document_max_length=4000` が既定。len なら文字 prefix、tokenizer なら token prefix を decode→encode して上限内を確認する。独自関数では文字 prefix を二分探索して上限内の結果を再検査し、空 prefix すら収まらなければ例外。非単調な関数では最長 prefix を保証しない。短文は原文を保持する。None で切り詰め無効。query は切り詰めない。元テキスト・入力 index と採点に使った prefix の区別を維持する。
+No `with`, `close`, or `aclose` is needed for normal use. These methods remain for
+compatibility: explicit closing rejects new work and waits for active calls to
+finish their own cleanup. Closing does not close injected resources. Do not mutate
+configuration during use.
 
-listwise の既定予算は state + 最大 question が `split_state_budget=26000`、request 全体が `split_request_budget=48000`。単位は選択した計測方法に従う。query、JSON、question を含めて検査する。文書数の差が最大1になるように長い文書から計測値の負荷を均す。候補順は query hash と元 index による決定的 shuffle とする。全候補をちょうど1回成功採点して raw Noul を統合する。同点判定には分割順を使わない。別 chunk では共有文脈が異なるため同じ較正は保証しない。旧 token 固有名の設定3つは互換 alias とし、計測単位を強制しない。
+## Scoring modes and rationale
 
-HTTP 400/422 の `detail.error_type=max_tokens_exceeded` では失敗 chunk の予算を半減して再分割する。成功済み chunk は再送しない。単一候補、pointwise の1文書、pairwise の1ペアが収まらなければ明示的な ContextLimitError とし、さらなる無断切り詰めや別モードへの変更はしない。
+Listwise and pointwise use Jev's binary decision output (Noul) as a score from
+0 to 1 for the configured true/false criteria. This is not a guarantee of
+empirically calibrated relevance probability.
 
-## 認証・設定
+- **Listwise (default):** Put the query and candidate set in one state, asking for a separate usefulness score for each document. This shares comparison context and reduces repeated query transmission; the API does not directly return a permutation. Split candidates when they exceed the context budget.
+- **Pointwise:** Score each query/document state independently. Adding or removing other candidates does not change that question's context. This supports large candidate sets but requires one request per candidate and repeats the query.
+- **Pairwise:** Ask both directions of “Is A more useful than B?” for every unordered pair in a shared state. A's win probability is `(p(A>B) + 1-p(B>A))/2`; B receives its complement. Rank by mean win probability. This supports relative-comparison experiments and mitigates positional bias, at O(n²) cost. It is not the default. A singleton receives 0.5. Scores are relative to the candidate set, not absolute relevance probabilities.
 
-API キーの優先順位は明示 `api_key` → 実際の環境変数 `api_key_env` → 指定 `.env` の同名値。`api_key_env='TYPESAFE_API_KEY'` を既定にして既存 TypeSafe との互換性を保つ。dotenv はプロセス全体の環境を書き換えずに読む。`dotenv_path=None` で無効。空の環境変数は未設定として扱う。キーがなければ ConfigurationError。dotenv と detail に OpenAI 用変数は不要。
+Ordinary reranking uses an English relevance question and true/false criteria. Send multilingual input unchanged as JSON query/documents. Prompts are configurable. The model defaults to `jev-latest` and can be pinned to a specific version.
 
-モデル指定は明示 model → JEV_MODEL（環境/.env）→ jev-latest。endpoint は明示 endpoint → TYPESAFE_ENDPOINT（環境/.env）→ https://api.typesafe.ai/v1/systemone。endpoint は完全な HTTPS URL（ローカル試験のみ HTTP localhost 可）、認証情報や query/fragment を URL に含めない。redirect を追従しない。
+## Length measurement, tokenizers, and partitioning
 
-既定 max_concurrency は listwise=4、pointwise/pairwise=20。instance 内の同時 HTTP 呼び出し数を制限する。listwise chunk は逐次処理。timeout=180秒は各 HTTP I/O のタイムアウトで呼び出し全体の deadline ではない。
+Long documents and candidate lists can exceed a request context budget. Prefix
+limits bound each submitted document; partitioning bounds the shared listwise
+context. These are separate controls: increasing a document limit can require
+more listwise chunks, while increasing a split budget cannot restore truncated
+text. Both limits use the configured length counter.
 
-## エラーと retry
+Default to Python `len(text)`, counting Unicode code points. The tokenizer is optional; base dependencies are only httpx and python-dotenv. Accept a deterministic synchronous `length_fn: Callable[[str], int]` returning nonnegative integers. Invalid values, including booleans and negatives, or counter failures raise `ConfigurationError`. Run counters in worker threads under an instance counting lock. Use the same measurement for documents and serialized state/questions/requests. Reject combining `length_fn` and `tokenizer`.
 
-429/500/502/503/504/529 と httpx transport error のみ bounded retry。`max_retries=8` は初回に加えた最大再試行回数。指数 backoff + jitter、Retry-After（秒/HTTP date）を尊重し、1回の待機は最大60秒。401/403、その他 validation error、壊れた JSON、欠落/過剰 answer、非有限値・範囲外 score、欠落/不正 usage/model は即座に失敗する。失敗を0点に置き換えない。通信が失われた request も課金された可能性があり、usage は請求台帳ではない。
+`tokenizer="google/embeddinggemma-300m"` lazily fetches tokenizer.json from the Hub and counts tokens. Named tokenizers require the tokenizer extra (`.[tokenizer]` in a checkout). Accept arbitrary encode/decode objects without requiring that extra. No model weights or PyTorch are needed. Use caller authentication/cache when Gemma license acceptance or Hugging Face authentication is required. Pin Gemma to revision `57c266a740f537b4dc058e1b0cda161fd15afa75`; allow overrides such as `split_tokenizer_revision="main"`. Other Hub repositories and local tokenizer.json files are supported. `split_tokenizer_name` aliases named selection.
 
-公開例外は JevError を基底として ConfigurationError、APIError（status_code）、ResponseValidationError、ContextLimitError。失敗時 detail を要求していれば例外の detail に途中までの実行記録を添付する。応答エラー本文や Authorization は例外・ログに出さない。
+Recommend tokenizers in production because character counts, especially in English, can cause premature truncation and partitioning. Gemma counts are still not guaranteed to equal Jev's internal tokens. For supplied objects, automatically raise `model_max_length` to `tokenizer_max_length` (default 65536) when smaller, mutating the object; preserve larger values. Leave objects without that attribute unchanged. A read-only attribute that needs raising causes `ConfigurationError`. Named tokenizers use the configured maximum-length metadata and disable truncation/padding, counting all tokens even beyond that value. This does not extend the EmbeddingGemma embedding model's context.
 
-## detail と再現性
+`document_max_length=4000` defaults to character prefixes with len, or decoded token prefixes with tokenizer measurement, re-encoding to verify the limit. Custom counters use binary search over text prefixes and validate the resulting bound; fail if even the empty prefix cannot fit. Nonmonotonic counters need not yield the longest possible prefix. Preserve short texts unchanged. None disables document truncation. Never truncate the query. Keep original text and input indices distinct from submitted prefixes.
 
-detail は schema_version=2、UTC 開始時刻、経過秒、package/Python/platform/dependency versions、endpoint、要求/解決 model、mode、実効 instructions/criteria、tokenizer/revision/予算、timeout/retry/concurrency、query/document hashes、切り詰めの original_length/sent_length/length_unit、split trace、リクエスト別質問・state・応答・試行回数・待機・usage、合算 usage を記録する。configuration に length_function と length_unit を、request に estimated_length を残す。usage の token 数は API の実測値でありローカル計測とは区別する。pairwise は相手 index と方向別判定も残す。api_key、HTTP 認証ヘッダー、任意の環境変数やマシンの hostname は収集しない。detail には query/document 本文が含まれるため、保存先と共有範囲は呼び出し側が管理する。自動でファイルを書かず、`json.dump(raw, ...)` で保存できる。
+Default listwise budgets are `split_state_budget=26000` for state plus the largest question and `split_request_budget=48000` for the full request, in the selected units. Include query, JSON, and questions in estimates. Balance measured load starting with long documents, with chunk document counts differing by at most one. Deterministically shuffle using the query hash and input index. Successfully score each candidate exactly once and combine the returned scores. Tie order uses original input, not partition order. Calibration across different chunk contexts is not guaranteed. Legacy token-named settings remain aliases without forcing token units.
 
-## テスト・配布
+On HTTP 400/422 with `detail.error_type=max_tokens_exceeded`, halve the failed chunk's budget and repartition it. Do not resend successful chunks. If a singleton, pointwise document, or pairwise pair cannot fit, raise `ContextLimitError` without silently truncating further or switching modes.
 
-TDD で async HTTP mock と小さい tokenizer を用いた offline テストを先に追加する。順位、同点、重複、kwargs、環境優先順位、分割/復旧、retry、validation、detail、並行呼び出し、同期/非同期の一致、loop 所有権、キャンセル、client の終了処理を検証する。
+## Authentication and configuration
 
-live E2E は pytest の `--live` 明示指定のみで実行し通常 CI では skip。実際の .env と Gemma tokenizer を使い、同期・非同期の双方で4文書の関連度順序を日英・中国語・スペイン語・混在言語で確認する。返却スコアが整列していることだけでなく、期待 index 順と strict なスコア差を検査する。実サービスは変動し得るため fixture を緩めて成功扱いにせず、失敗時は detail を診断する。
+Key precedence: explicit `api_key` → actual environment variable named by `api_key_env` → the same key in the selected `.env`. Default `api_key_env='TYPESAFE_API_KEY'` preserves TypeSafe compatibility. Read dotenv without changing process-wide environment variables. `dotenv_path=None` disables it. Treat empty environment values as missing; a missing key raises `ConfigurationError`. OpenAI variables are unnecessary.
 
-uv cooldown と lock を維持し、tox、clean build、twine strict、隔離 wheel install、sdist/wheel 内容検査を通す。公開済み0.0.1の version/tag は再利用せず、公開作業は docs/release.md の reviewed PR フローで別途行う。
+Model precedence: explicit model → `JEV_MODEL` in environment/`.env` → `jev-latest`. Endpoint precedence: explicit endpoint → `TYPESAFE_ENDPOINT` → `https://api.typesafe.ai/v1/systemone`. Require an absolute HTTPS URL, allowing local HTTP for tests. Reject URL credentials, query strings, and fragments. Do not follow redirects.
 
-## 参照
+Default `max_concurrency` is 4 for listwise and 20 for pointwise/pairwise, shared across the instance. Listwise chunks remain sequential. The 180-second timeout applies to each HTTP I/O, not the entire ranking call.
 
-- 移植元: hakari-bench `hakari_bench/models.py` の TypeSafeRerankerAdapter（MIT）。
+## Errors and retries
+
+Retry only HTTP 429/500/502/503/504/529 and httpx transport errors. `max_retries=8` allows eight retries after the initial attempt. Use exponential backoff with jitter and respect Retry-After seconds or HTTP dates, capped at 60 seconds per wait. Fail immediately on 401/403, other validation failures, malformed JSON, missing/extra answers, nonfinite or out-of-range scores, and missing/invalid usage or model data. Never substitute zero scores for failures. Requests with lost responses may still be billed; usage logs are not a billing ledger.
+
+Public exceptions derive from `JevError`: `ConfigurationError`, `APIError` (with `status_code`), `ResponseValidationError`, and `ContextLimitError`. When requested, attach partial execution details to failures. Do not expose response error bodies or Authorization values in exceptions or logs.
+
+## Details and reproducibility
+
+Detail schema version 2 records UTC start time, elapsed seconds, package/Python/platform/dependency versions, endpoint, requested/resolved model, mode, effective instructions/criteria, tokenizer/revision/budgets, timeout/retry/concurrency settings, query/document hashes, original/sent lengths and units, split traces, per-request questions/state/responses/attempts/waits/usage, and aggregate usage. Record `configuration.length_function`, `length_unit`, and request `estimated_length`. API token usage is measured by the service and is distinct from local estimates. Pairwise details include opponent indices and directional judgments.
+
+Do not collect API keys, authentication headers, arbitrary environment variables, or hostnames. Details contain query and document text, so callers control storage and sharing. The library does not write files automatically; callers can use `json.dump(response, ...)`.
+
+## Testing and distribution
+
+Use TDD with async HTTP mocks and small tokenizers for offline tests. Cover rankings, ties, duplicates, kwargs, environment precedence, partition/recovery, retries, validation, details, concurrent calls, sync/async equivalence, borrowed-client loop ownership, cancellation, and per-call client cleanup.
+
+Live E2E runs only with explicit pytest `--live`; normal CI skips it. Use the real `.env` and Gemma tokenizer to verify four-document relevance ordering in English, Japanese, Chinese, Spanish, and mixed languages through both sync and async APIs. Assert expected input indices and strict score differences, not merely sorted output. Diagnose failures through details instead of automatically relaxing expectations when the service changes.
+
+Preserve the uv cooldown and lock. Validate tox, clean builds, strict twine checks, isolated wheel installation, and sdist/wheel contents. Follow the [release guide](release.md) for publishing; never reuse a published version or tag.
+
+## References
+
+- [HAKARI-Bench](https://github.com/hakari-bench/hakari-bench): TypeSafe reranker and partitioning design (MIT).
 - https://docs.typesafe.ai/api
 - https://docs.typesafe.ai/models
 - https://docs.typesafe.ai/cookbooks/rerank_typesafe

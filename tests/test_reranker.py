@@ -76,25 +76,23 @@ def test_scores_sorted_and_duplicate_identity(mode):
         return httpx.Response(200, json=response(p, scores))
 
     ranker, calls = make(handler, mode=mode)
-    results = ranker.rank("q", ["bad", "good", "good"])
+    results = ranker.rerank("q", ["bad", "good", "good"])["results"]
     assert [r["document_index"] for r in results] == [1, 2, 0]
     assert [r["score"] for r in results] == [0.9, 0.9, 0.1]
     assert results[0]["text"] == "good"
     assert len(calls) == (1 if mode == "listwise" else 3)
 
 
-def test_wrapper_and_top_k(monkeypatch):
+def test_top_k():
     ranker, calls = make()
-    assert ranker.raw_rerank("q", [], detail=True)["results"] == []
-    assert ranker.rerank("q", ["a"], top_k=0) == []
+    assert ranker.rerank("q", [], detail=True)["results"] == []
+    assert ranker.rerank("q", ["a"], top_k=0) == {"results": []}
     assert not calls
-    assert ranker.rank("q", ["a", "b"], top_k=1, return_documents=False) == [
+    assert ranker.rerank("q", ["a", "b"], top_k=1, return_documents=False)["results"] == [
         {"document_index": 0, "score": 0.5}
     ]
     assert len(calls[0]["questions"]) == 2
-    monkeypatch.setattr(ranker, "raw_rerank", lambda *a, **kw: {"results": ["wrapper"]})
-    assert ranker.rerank("q", ["a"]) == ["wrapper"]
-    assert ranker.rank("q", ["a"]) == ["wrapper"]
+
 
 
 @pytest.mark.parametrize(
@@ -147,14 +145,14 @@ def test_invalid_configuration(kwargs):
 def test_bad_input_never_calls_api(query, docs, kwargs):
     ranker, calls = make()
     with pytest.raises((ValueError, TypeError)):
-        ranker.rank(query, docs, **kwargs)
+        ranker.rerank(query, docs, **kwargs)
     assert not calls
 
 
 def test_unknown_kwargs():
     ranker, calls = make()
     with pytest.raises(TypeError):
-        ranker.rank("q", ["a"], typo=True)
+        ranker.rerank("q", ["a"], typo=True)
     with pytest.raises(TypeError):
         JevReranker(api_key="test", batch_size=3)  # ty: ignore[unknown-argument]
     assert not calls
@@ -188,7 +186,7 @@ def test_env_precedence_and_no_global_mutation(monkeypatch, tmp_path):
 
 def test_truncation_and_detail():
     ranker, calls = make(document_max_tokens=3)
-    raw = ranker.raw_rerank("質問", ["abcdef", "猫"], detail=True)
+    raw = ranker.rerank("質問", ["abcdef", "猫"], detail=True)
     assert calls[0]["state"]["documents"] == {"doc_0": "abc", "doc_1": "猫"}
     assert raw["results"][0]["text"] == "abcdef"
     assert raw["results"][0]["detail"]["sent_length"] == 3
@@ -200,13 +198,13 @@ def test_truncation_and_detail():
     assert detail["configuration"]["model"] == "jev-latest"
     assert detail["environment"]["python"]
     assert "secret-test-key" not in json.dumps(raw)
-    assert "detail" not in ranker.raw_rerank("q", ["a"])
+    assert "detail" not in ranker.rerank("q", ["a"])
 
 
 def test_budget_split_every_candidate_once_stable_ties():
     ranker, calls = make(split_state_token_budget=1100, split_request_token_budget=1800)
     docs = [str(i) * 100 for i in range(11)]
-    raw = ranker.raw_rerank("q", docs, detail=True)
+    raw = ranker.rerank("q", docs, detail=True)
     keys = [k for p in calls for k in p["questions"]]
     assert len(calls) > 1
     assert sorted(keys) == sorted(f"doc_{i}" for i in range(11))
@@ -230,7 +228,7 @@ def test_server_overflow_splits_without_resending_successes():
         return httpx.Response(200, json=response(p))
 
     ranker, calls = make(handler)
-    raw = ranker.raw_rerank("q", ["a"] * 5, detail=True)
+    raw = ranker.rerank("q", ["a"] * 5, detail=True)
     successful = [k for p in calls if len(p["questions"]) <= 2 for k in p["questions"]]
     assert sorted(successful) == [f"doc_{i}" for i in range(5)]
     assert raw["detail"]["usage"]["max_tokens_errors"] >= 1
@@ -240,7 +238,7 @@ def test_server_overflow_splits_without_resending_successes():
 def test_unsplittable_raises_with_detail(mode):
     ranker, calls = make(mode=mode, split_state_token_budget=1)
     with pytest.raises(ContextLimitError) as exc:
-        ranker.raw_rerank("q", ["a", "b"] if mode == "pairwise" else ["a"], detail=True)
+        ranker.rerank("q", ["a", "b"] if mode == "pairwise" else ["a"], detail=True)
     assert exc.value.detail is not None
     assert exc.value.detail["status"] == "failed"
     assert not calls
@@ -261,7 +259,7 @@ def test_retries_transient_status(monkeypatch, status):
         return httpx.Response(200, json=response(p))
 
     ranker, calls = make(handler, max_retries=1)
-    raw = ranker.raw_rerank("q", ["a"], detail=True)
+    raw = ranker.rerank("q", ["a"], detail=True)
     assert len(calls) == 2
     assert waits == [2.0]
     assert raw["detail"]["usage"]["retries"] == 1
@@ -271,7 +269,7 @@ def test_retries_transient_status(monkeypatch, status):
 def test_no_retry_permanent_errors(status):
     ranker, calls = make(lambda p, n, r: httpx.Response(status, text="secret-test-key"))
     with pytest.raises(APIError) as exc:
-        ranker.rank("q", ["a"])
+        ranker.rerank("q", ["a"])
     assert exc.value.status_code == status
     assert "secret-test-key" not in str(exc.value)
     assert len(calls) == 1
@@ -285,7 +283,7 @@ def test_transport_retry_exhaustion(monkeypatch):
 
     ranker, calls = make(handler, max_retries=2)
     with pytest.raises(APIError) as exc:
-        ranker.raw_rerank("q", ["a"], detail=True)
+        ranker.rerank("q", ["a"], detail=True)
     assert len(calls) == 3
     assert "secret-test-key" not in str(exc.value)
     assert exc.value.detail is not None
@@ -303,7 +301,7 @@ def test_invalid_scores(value):
 
     ranker, calls = make(handler)
     with pytest.raises(ResponseValidationError):
-        ranker.rank("q", ["a"])
+        ranker.rerank("q", ["a"])
     assert len(calls) == 1
 
 
@@ -324,7 +322,7 @@ def test_bad_response_metadata(field, value):
 
     ranker, _ = make(handler)
     with pytest.raises(ResponseValidationError):
-        ranker.rank("q", ["a"])
+        ranker.rerank("q", ["a"])
 
 
 def test_pairwise_average_symmetric_wins():
@@ -343,14 +341,14 @@ def test_pairwise_average_symmetric_wins():
         )
 
     ranker, calls = make(handler, mode="pairwise")
-    raw = ranker.raw_rerank("q", ["2", "0", "3", "1"], detail=True)
+    raw = ranker.rerank("q", ["2", "0", "3", "1"], detail=True)
     assert [r["document_index"] for r in raw["results"]] == [2, 0, 3, 1]
     assert [r["score"] for r in raw["results"]] == pytest.approx(
         [0.9, 1.9 / 3, 1.1 / 3, 0.1]
     )
     assert len(calls) == 6
     assert len(raw["results"][0]["detail"]["comparisons"]) == 3
-    assert ranker.rank("q", ["a"])[0]["score"] == 0.5
+    assert ranker.rerank("q", ["a"])["results"][0]["score"] == 0.5
     assert len(calls) == 6
 
 
@@ -358,7 +356,7 @@ def test_parallel_calls_keep_statistics_separate():
     ranker, _ = make(mode="pointwise")
     with ThreadPoolExecutor(max_workers=2) as pool:
         outputs = list(
-            pool.map(lambda n: ranker.raw_rerank("q", ["a"] * n, detail=True), [2, 3])
+            pool.map(lambda n: ranker.rerank("q", ["a"] * n, detail=True), [2, 3])
         )
     assert [out["detail"]["usage"]["requests"] for out in outputs] == [2, 3]
     assert [len(out["detail"]["requests"]) for out in outputs] == [2, 3]
@@ -368,7 +366,7 @@ def test_closed_client_fails_before_request():
     ranker, calls = make()
     ranker.close()
     with pytest.raises(ConfigurationError, match="closed"):
-        ranker.rank("q", ["a"])
+        ranker.rerank("q", ["a"])
     assert not calls
 
 
@@ -383,7 +381,7 @@ def test_custom_instructions_and_criteria_are_sent():
         instructions="Does {document} answer `query`?", criteria=criteria
     )
     criteria["true"] = "mutated"
-    ranker.rank("q", ["a"])
+    ranker.rerank("q", ["a"])
     question = calls[0]["questions"]["doc_0"]
     assert question["instructions"] == "Does `documents.doc_0` answer `query`?"
     assert question["criteria"]["true"] == "Answers the question"
@@ -407,7 +405,7 @@ def test_successful_chunk_not_replayed_when_later_chunk_overflows():
     ranker, _ = make(
         handler, split_state_token_budget=1500, split_request_token_budget=3000
     )
-    raw = ranker.raw_rerank("q", ["a" * 100] * 20, detail=True)
+    raw = ranker.rerank("q", ["a" * 100] * 20, detail=True)
     assert overflowed
     assert len(success_keys) == len(set(success_keys)) == 20
     assert raw["detail"]["usage"]["max_tokens_errors"] == 1
@@ -422,7 +420,7 @@ def test_transport_success_after_timeout(monkeypatch):
         return httpx.Response(200, json=response(p))
 
     ranker, calls = make(handler, max_retries=1)
-    assert ranker.rank("q", ["a"])[0]["score"] == 0.5
+    assert ranker.rerank("q", ["a"])["results"][0]["score"] == 0.5
     assert len(calls) == 2
 
 
@@ -430,7 +428,7 @@ def test_exhausted_http_retry_and_zero_retry(monkeypatch):
     monkeypatch.setattr("jev_reranker._client.asyncio.sleep", no_sleep)
     ranker, calls = make(lambda p, n, r: httpx.Response(503), max_retries=0)
     with pytest.raises(APIError) as exc:
-        ranker.raw_rerank("q", ["a"], detail=True)
+        ranker.rerank("q", ["a"], detail=True)
     assert len(calls) == 1
     assert exc.value.detail is not None
     assert exc.value.detail["usage"]["attempts"] == 1
@@ -441,7 +439,7 @@ def test_exhausted_http_retry_and_zero_retry(monkeypatch):
 def test_malformed_success_response(body):
     ranker, calls = make(lambda p, n, r: httpx.Response(200, content=body))
     with pytest.raises(ResponseValidationError):
-        ranker.rank("q", ["a"])
+        ranker.rerank("q", ["a"])
     assert len(calls) == 1
 
 
@@ -452,7 +450,7 @@ def test_api_overflow_single_document_is_not_retried():
         )
     )
     with pytest.raises(ContextLimitError):
-        ranker.rank("q", ["a"])
+        ranker.rerank("q", ["a"])
     assert len(calls) == 1
 
 
@@ -464,7 +462,7 @@ def test_detail_redacts_echoed_api_key():
 
     ranker, _ = make(handler)
     assert "secret-test-key" not in json.dumps(
-        ranker.raw_rerank("q", ["a"], detail=True)
+        ranker.rerank("q", ["a"], detail=True)
     )
 
 
@@ -508,9 +506,9 @@ def test_global_concurrency_bound_across_calls():
 
     ranker, _ = make(handler, mode="pointwise", max_concurrency=2)
     with ThreadPoolExecutor(max_workers=3) as pool:
-        outputs = list(pool.map(lambda _: ranker.rank("q", ["a"] * 4), range(3)))
+        outputs = list(pool.map(lambda _: ranker.rerank("q", ["a"] * 4), range(3)))
     assert maximum == 2
-    assert all(len(result) == 4 for result in outputs)
+    assert all(len(result["results"]) == 4 for result in outputs)
 
 
 def test_huge_integer_score_is_validation_error():
@@ -519,4 +517,4 @@ def test_huge_integer_score_is_validation_error():
 
     ranker, _ = make(handler)
     with pytest.raises(ResponseValidationError):
-        ranker.rank("q", ["a"])
+        ranker.rerank("q", ["a"])

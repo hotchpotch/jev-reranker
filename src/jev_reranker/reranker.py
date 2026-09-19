@@ -8,7 +8,6 @@ import hashlib
 import math
 import os
 import platform
-import string
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -28,26 +27,21 @@ from . import _client
 from ._ranking import SHUFFLE_SEED, score_listwise
 from ._runtime import Runtime, require_sync_context
 from .errors import ConfigurationError, ContextLimitError, JevError
+from .instructions import (
+    CRITERIA,
+    INSTRUCTIONS,
+    PAIRWISE_CRITERIA,
+    PAIRWISE_INSTRUCTIONS,
+    POINTWISE_RELEVANCE_INSTRUCTION,
+    RELEVANCE_INSTRUCTION,
+    validate_instruction,
+)
 from .tokenization import (
     DEFAULT_TOKENIZER,
     DEFAULT_TOKENIZER_REVISION,
     HuggingFaceTokenizer,
     Tokenizer,
 )
-
-INSTRUCTIONS = "Does {document} help answer `query`? Prefer passages with the specific facts needed."
-PAIRWISE_INSTRUCTIONS = (
-    "Does {left} help answer `query` better than {right}? "
-    "Prefer passages containing the specific facts needed to answer the query."
-)
-CRITERIA = {
-    "true": "Contains specific information that answers or is necessary for answering the query",
-    "false": "Unrelated, only tangentially related, or lacks the needed facts",
-}
-PAIRWISE_CRITERIA = {
-    "true": "The first passage provides more of the specific information needed to answer the query",
-    "false": "The second passage provides more of the specific information needed to answer the query",
-}
 
 
 def positive_int(name: str, value: Any, *, minimum: int = 1) -> None:
@@ -67,6 +61,9 @@ def sha(text: str) -> str:
 @dataclass
 class _Run:
     detailed: bool
+    instruction: dict[str, Any] = field(default_factory=dict)
+    threshold: float = 0.0
+    selection: dict[str, Any] = field(default_factory=dict)
     usage: dict[str, int] = field(
         default_factory=lambda: {
             "requests": 0,
@@ -136,6 +133,7 @@ class JevReranker:
         document_max_tokens: int | None | _Unset = _Unset.VALUE,
         split_state_token_budget: int | _Unset = _Unset.VALUE,
         split_request_token_budget: int | _Unset = _Unset.VALUE,
+        instruction: dict[str, Any] | None = None,
         instructions: str | None = None,
         criteria: dict[str, str] | None = None,
         client: httpx.AsyncClient | None = None,
@@ -260,36 +258,26 @@ class JevReranker:
             raise ConfigurationError(
                 "endpoint must be an HTTPS URL without credentials, query, or fragment."
             ) from None
-        instructions = (
-            instructions
-            if instructions is not None
-            else (PAIRWISE_INSTRUCTIONS if mode == "pairwise" else INSTRUCTIONS)
-        )
-        nonempty("instructions", instructions)
-        fields = {"left", "right"} if mode == "pairwise" else {"document"}
-        try:
-            parsed = list(string.Formatter().parse(instructions))
-            actual = {f for _, f, _, _ in parsed if f is not None}
-            if actual != fields or any(
-                spec or conversion for _, _, spec, conversion in parsed
-            ):
-                raise ValueError
-            instructions.format(**dict.fromkeys(fields, "reference"))
-        except (ValueError, KeyError, IndexError, AttributeError):
+        if instruction is not None and (
+            instructions is not None or criteria is not None
+        ):
             raise ConfigurationError(
-                f"instructions must use only these placeholders: {sorted(fields)}."
-            ) from None
-        criteria = copy.deepcopy(
-            criteria
-            if criteria is not None
-            else (PAIRWISE_CRITERIA if mode == "pairwise" else CRITERIA)
-        )
-        if not isinstance(criteria, dict) or set(criteria) != {"true", "false"}:
-            raise ConfigurationError(
-                "criteria must contain true and false descriptions."
+                "Pass instruction or legacy instructions/criteria, not both."
             )
-        for value in criteria.values():
-            nonempty("criteria description", value)
+        prompt = validate_instruction(
+            instruction
+            if instruction is not None
+            else {
+                "instructions": instructions
+                if instructions is not None
+                else (PAIRWISE_INSTRUCTIONS if mode == "pairwise" else INSTRUCTIONS),
+                "criteria": criteria
+                if criteria is not None
+                else (PAIRWISE_CRITERIA if mode == "pairwise" else CRITERIA),
+            },
+            mode,
+        )
+        instructions, criteria = prompt["instructions"], prompt["criteria"]
         self.model, self.mode, self.endpoint = model, mode, endpoint
         self.max_concurrency, self.timeout, self.max_retries = (
             max_concurrency,
@@ -329,11 +317,11 @@ class JevReranker:
         self._runtime = Runtime(max_concurrency, client, transport)
 
     def close(self) -> None:
-        """Wait for sync calls and close owned resources and the sync loop thread."""
+        """Optionally disable the instance and wait for active calls to finish."""
         self._runtime.close()
 
     async def aclose(self) -> None:
-        """Wait for async calls and close owned resources on their event loop."""
+        """Optionally disable the instance and await active calls; no idle pool is held."""
         await self._runtime.aclose()
 
     def __enter__(self) -> Self:
@@ -352,100 +340,128 @@ class JevReranker:
     async def __aexit__(self, *exc: object) -> None:
         await self.aclose()
 
+    def relevance_rerank(
+        self,
+        query: str,
+        documents: Sequence[str],
+        *,
+        instruction: dict[str, Any] | None = None,
+        threshold: float = 0.2,
+        top_k: int | None = None,
+        return_documents: bool = True,
+        detail: bool = False,
+    ) -> dict[str, Any]:
+        """Rank evidence usefulness with the relevance prompt; default cutoff 0.2."""
+        self._check_relevance_mode()
+        if instruction is None:
+            instruction = (
+                POINTWISE_RELEVANCE_INSTRUCTION
+                if self.mode == "pointwise"
+                else RELEVANCE_INSTRUCTION
+            )
+        return self.rerank(
+            query,
+            documents,
+            instruction=instruction,
+            threshold=threshold,
+            top_k=top_k,
+            return_documents=return_documents,
+            detail=detail,
+        )
+
+    def _check_relevance_mode(self) -> None:
+        if self.mode == "pairwise":
+            raise ConfigurationError(
+                "relevance_rerank requires listwise or pointwise, not pairwise win probabilities."
+            )
+
     def rerank(
         self,
         query: str,
         documents: Sequence[str],
         *,
-        top_k: int | None = None,
-        return_documents: bool = True,
-        detail: bool = False,
-    ) -> list[dict[str, Any]]:
-        """Return sorted results from :meth:`raw_rerank`."""
-        return self.raw_rerank(
-            query,
-            documents,
-            top_k=top_k,
-            return_documents=return_documents,
-            detail=detail,
-        )["results"]
-
-    rank = rerank
-
-    def raw_rerank(
-        self,
-        query: str,
-        documents: Sequence[str],
-        *,
+        instruction: dict[str, Any] | None = None,
+        threshold: float = 0.0,
         top_k: int | None = None,
         return_documents: bool = True,
         detail: bool = False,
     ) -> dict[str, Any]:
-        """Blocking wrapper over a_raw_rank, reusing a dedicated event loop."""
+        """Blocking common scoring pipeline with optional complete execution detail."""
         return self._runtime.run(
-            lambda: self.a_raw_rank(
+            lambda: self.a_rerank(
                 query,
                 documents,
+                instruction=instruction,
+                threshold=threshold,
                 top_k=top_k,
                 return_documents=return_documents,
                 detail=detail,
             )
         )
 
-    raw_rank = raw_rerank
-
-    async def a_rank(
+    async def a_relevance_rerank(
         self,
         query: str,
         documents: Sequence[str],
         *,
-        top_k: int | None = None,
-        return_documents: bool = True,
-        detail: bool = False,
-    ) -> list[dict[str, Any]]:
-        """Await sorted results from a_raw_rank."""
-        return (
-            await self.a_raw_rank(
-                query,
-                documents,
-                top_k=top_k,
-                return_documents=return_documents,
-                detail=detail,
-            )
-        )["results"]
-
-    a_rerank = a_rank
-
-    async def a_raw_rank(
-        self,
-        query: str,
-        documents: Sequence[str],
-        *,
+        instruction: dict[str, Any] | None = None,
+        threshold: float = 0.2,
         top_k: int | None = None,
         return_documents: bool = True,
         detail: bool = False,
     ) -> dict[str, Any]:
-        """Return results and optional execution detail on the owning event loop.
+        """Async relevance scoring and filtering through the shared rerank pipeline."""
+        self._check_relevance_mode()
+        if instruction is None:
+            instruction = (
+                POINTWISE_RELEVANCE_INSTRUCTION
+                if self.mode == "pointwise"
+                else RELEVANCE_INSTRUCTION
+            )
+        return await self.a_rerank(
+            query,
+            documents,
+            instruction=instruction,
+            threshold=threshold,
+            top_k=top_k,
+            return_documents=return_documents,
+            detail=detail,
+        )
 
-        Cancellation propagates after this call's pending HTTP tasks are cleaned
-        up. Query/document text is present in detail; credentials are not.
+    async def a_rerank(
+        self,
+        query: str,
+        documents: Sequence[str],
+        *,
+        instruction: dict[str, Any] | None = None,
+        threshold: float = 0.0,
+        top_k: int | None = None,
+        return_documents: bool = True,
+        detail: bool = False,
+    ) -> dict[str, Any]:
+        """Score documents and return results plus optional complete execution logs.
+
+        Cancellation drains pending HTTP tasks. Detail includes rejected document
+        scores and sent text, but never credentials. No logs are written to disk.
         """
         async with self._runtime.operation():
-            return await self._a_raw_rank(
+            return await self._rerank(
                 query,
                 documents,
+                instruction=instruction,
+                threshold=threshold,
                 top_k=top_k,
                 return_documents=return_documents,
                 detail=detail,
             )
 
-    a_raw_rerank = a_raw_rank
-
-    async def _a_raw_rank(
+    async def _rerank(
         self,
         query: str,
         documents: Sequence[str],
         *,
+        instruction: dict[str, Any] | None = None,
+        threshold: float = 0.0,
         top_k: int | None = None,
         return_documents: bool = True,
         detail: bool = False,
@@ -455,6 +471,20 @@ class JevReranker:
         detail includes the text sent to the API. It contains no authentication
         headers or API key. No files are written automatically.
         """
+        prompt = validate_instruction(
+            {"instructions": self.instructions, "criteria": self.criteria}
+            if instruction is None
+            else instruction,
+            self.mode,
+        )
+        if (
+            isinstance(threshold, bool)
+            or not isinstance(threshold, (int, float))
+            or not 0 <= threshold <= 1
+        ):
+            raise ConfigurationError(
+                "threshold must be a finite number between 0 and 1."
+            )
         nonempty("query", query)
         if isinstance(documents, (str, bytes)) or not isinstance(documents, Sequence):
             raise TypeError("documents must be a sequence of strings.")
@@ -466,15 +496,32 @@ class JevReranker:
         if not isinstance(detail, bool) or not isinstance(return_documents, bool):
             raise TypeError("detail and return_documents must be bool.")
         started, start_utc = time.monotonic(), datetime.now(UTC).isoformat()
-        run = _Run(detail)
+        run = _Run(detail, instruction=prompt, threshold=float(threshold))
         try:
             if not docs or top_k == 0:
                 scores: list[float] = []
             else:
                 prepared = await asyncio.to_thread(self._prepare, docs, run)
                 scores = await self._score(query, prepared, run)
+            eligible = [
+                i
+                for i in sorted(range(len(scores)), key=lambda i: -scores[i])
+                if scores[i] >= threshold
+            ]
+            selected = eligible[:top_k]
+            run.selection = {
+                "top_k": top_k,
+                "scored_count": len(scores),
+                "above_threshold_count": len(eligible),
+                "returned_count": len(selected),
+            }
+            if detail:
+                for index, score in enumerate(scores):
+                    run.documents[index].update(
+                        score=score, passes_threshold=score >= threshold
+                    )
             results = []
-            for index in sorted(range(len(scores)), key=lambda i: -scores[i])[:top_k]:
+            for index in selected:
                 result: dict[str, Any] = {
                     "document_index": index,
                     "score": scores[index],
@@ -603,15 +650,21 @@ class JevReranker:
                     )
         return prepared
 
-    def _question(self, **references: str) -> dict[str, Any]:
+    def _question(
+        self, instruction: dict[str, Any], **references: str
+    ) -> dict[str, Any]:
         return {
             "type": "noul",
-            "instructions": self.instructions.format(**references),
-            "criteria": self.criteria,
+            "instructions": instruction["instructions"].format(**references),
+            "criteria": instruction["criteria"],
         }
 
     def _payload(
-        self, query: str, docs: list[str], indices: list[int]
+        self,
+        query: str,
+        docs: list[str],
+        indices: list[int],
+        instruction: dict[str, Any],
     ) -> dict[str, Any]:
         if self.mode == "pairwise":
             state = {
@@ -620,19 +673,23 @@ class JevReranker:
                 "right": docs[indices[1]],
             }
             questions = {
-                "left_wins": self._question(left="`left`", right="`right`"),
-                "right_wins": self._question(left="`right`", right="`left`"),
+                "left_wins": self._question(
+                    instruction, left="`left`", right="`right`"
+                ),
+                "right_wins": self._question(
+                    instruction, left="`right`", right="`left`"
+                ),
             }
         elif self.mode == "pointwise":
             state = {"query": query, "document": docs[indices[0]]}
-            questions = {"relevant": self._question(document="`document`")}
+            questions = {"relevant": self._question(instruction, document="`document`")}
         else:
             state = {
                 "query": query,
                 "documents": {f"doc_{i}": docs[i] for i in indices},
             }
             questions = {
-                f"doc_{i}": self._question(document=f"`documents.doc_{i}`")
+                f"doc_{i}": self._question(instruction, document=f"`documents.doc_{i}`")
                 for i in indices
             }
         return {"model": self.model, "state": state, "questions": questions}
@@ -698,7 +755,7 @@ class JevReranker:
 
     async def _score(self, query: str, docs: list[str], run: _Run) -> list[float]:
         def payload(indices: list[int]) -> dict[str, Any]:
-            return self._payload(query, docs, indices)
+            return self._payload(query, docs, indices, run.instruction)
 
         async def score_one(indices: list[int]) -> list[float]:
             body = payload(indices)
@@ -800,8 +857,9 @@ class JevReranker:
                 "model": self.model,
                 "mode": self.mode,
                 "endpoint": self.endpoint,
-                "instructions": self.instructions,
-                "criteria": self.criteria,
+                "instructions": run.instruction["instructions"],
+                "criteria": run.instruction["criteria"],
+                "threshold": run.threshold,
                 "max_concurrency": self.max_concurrency,
                 "timeout": self.timeout,
                 "max_retries": self.max_retries,
@@ -831,6 +889,7 @@ class JevReranker:
             },
             "query_sha256": sha(query),
             "document_count": len(docs),
+            "selection": run.selection,
             "documents": run.documents,
             "document_sha256": [sha(d) for d in docs],
             "resolved_models": sorted(run.models),

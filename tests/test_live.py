@@ -95,9 +95,9 @@ def test_multilingual_order(language, mode, interface):
         async with JevReranker(
             mode=mode, max_retries=2, tokenizer="google/embeddinggemma-300m"
         ) as ranker:
-            raw = await ranker.a_raw_rank(query, documents, detail=True)
-            # Reuse this client on the same loop, including after a real request.
-            assert await ranker.a_rank(query, [], detail=False) == []
+            raw = await ranker.a_rerank(query, documents, detail=True)
+            # Reuse the ranker after the previous call has cleaned up its HTTP client.
+            assert await ranker.a_rerank(query, [], detail=False) == {"results": []}
             return raw
 
     try:
@@ -107,7 +107,7 @@ def test_multilingual_order(language, mode, interface):
             with JevReranker(
                 mode=mode, max_retries=2, tokenizer="google/embeddinggemma-300m"
             ) as ranker:
-                raw = ranker.raw_rerank(query, documents, detail=True)
+                raw = ranker.rerank(query, documents, detail=True)
     except JevError as exc:
         path.write_text(json.dumps(exc.detail, ensure_ascii=False, indent=2) + "\n")
         raise
@@ -124,22 +124,84 @@ def test_multilingual_order(language, mode, interface):
 
 @pytest.mark.live
 @pytest.mark.parametrize("interface", ["sync", "async"])
-def test_live_client_reuse(interface):
+def test_live_ranker_reuse(interface):
     query = "Which planet is called the Red Planet?"
     documents = ["Mars is called the Red Planet.", "Bread is made from flour."]
 
     async def async_run():
-        async with JevReranker(max_retries=2) as ranker:
-            return [
-                await ranker.a_raw_rank(query, documents, detail=True) for _ in range(2)
-            ]
+        ranker = JevReranker(max_retries=2)
+        return [
+            await ranker.a_rerank(query, documents, detail=True) for _ in range(2)
+        ]
 
     if interface == "async":
         raws = asyncio.run(async_run())
     else:
-        with JevReranker(max_retries=2) as ranker:
-            raws = [ranker.raw_rerank(query, documents, detail=True) for _ in range(2)]
+        ranker = JevReranker(max_retries=2)
+        raws = [ranker.rerank(query, documents, detail=True) for _ in range(2)]
     for raw in raws:
         assert [r["document_index"] for r in raw["results"]] == [0, 1]
         assert raw["results"][0]["score"] > raw["results"][1]["score"]
         assert raw["detail"]["usage"]["requests"] == 1
+
+
+@pytest.mark.live
+@pytest.mark.parametrize("interface", ["sync", "async"])
+@pytest.mark.parametrize("mode", ["listwise", "pointwise"])
+@pytest.mark.parametrize("language", CASES)
+def test_live_relevance_rerank(language, mode, interface):
+    """The relevance prompt retains answer facts and rejects unrelated content."""
+    from jev_reranker import POINTWISE_RELEVANCE_INSTRUCTION, RELEVANCE_INSTRUCTION
+
+    relevance_instruction = (
+        POINTWISE_RELEVANCE_INSTRUCTION if mode == "pointwise" else RELEVANCE_INSTRUCTION
+    )
+
+    query, by_relevance = CASES[language]
+    documents = [by_relevance[i] for i in [1, 3, 0, 2]]
+    output = Path(".live-results")
+    output.mkdir(exist_ok=True)
+    path = (
+        output
+        / f"{datetime.now(UTC):%Y%m%dT%H%M%S%f}-relevance-{language}-{mode}-{interface}.json"
+    )
+
+    async def async_run():
+        async with JevReranker(mode=mode, max_retries=2) as ranker:
+            raw = await ranker.a_rerank(
+                query, documents, instruction=relevance_instruction, detail=True
+            )
+            selected = await ranker.a_relevance_rerank(query, documents, detail=True)
+            return raw, selected
+
+    if interface == "async":
+        raw, selected = asyncio.run(async_run())
+    else:
+        with JevReranker(mode=mode, max_retries=2) as ranker:
+            raw = ranker.rerank(
+                query, documents, instruction=relevance_instruction, detail=True
+            )
+            selected = ranker.relevance_rerank(query, documents, detail=True)
+    path.write_text(
+        json.dumps(
+            {"raw": raw, "relevance_rerank_default": selected},
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    assert [r["document_index"] for r in raw["results"]] == [2, 0, 3, 1], (
+        f"Inspect {path}"
+    )
+    assert all(a["score"] > b["score"] for a, b in pairwise(raw["results"])), (
+        f"Inspect {path}"
+    )
+    selected_ids = [r["document_index"] for r in selected["results"]]
+    assert selected_ids[:2] == [2, 0], f"Inspect {path}"
+    assert 1 not in selected_ids, f"Inspect {path}"
+    # The overview states a capability and points to a guide. The evidence
+    # prompt may retain it as incomplete support; it is not an unrelated control.
+    assert all(r["score"] >= 0.2 for r in selected["results"])
+    assert (
+        raw["detail"]["configuration"]["instructions"]
+        == relevance_instruction["instructions"]
+    )

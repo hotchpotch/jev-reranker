@@ -57,7 +57,7 @@ jobs:
           from importlib.util import find_spec
           import httpx
           import jev_reranker
-          from jev_reranker import ConfigurationError, HuggingFaceTokenizer, JevReranker
+          from jev_reranker import ConfigurationError, HuggingFaceTokenizer, JevReranker, RELEVANCE_INSTRUCTION
 
           assert find_spec("tokenizers") is None
           assert find_spec("huggingface_hub") is None
@@ -75,12 +75,18 @@ jobs:
                                  transport=httpx.MockTransport(respond))
 
           with ranker() as reranker:
-              assert reranker.rank("query", ["document"])[0]["document_index"] == 0
+              assert reranker.rerank("query", ["document"])["results"][0]["document_index"] == 0
+              assert reranker.relevance_rerank("query", ["document"])["results"][0]["score"] == 0.5
+              raw = reranker.rerank("query", ["document"], instruction=RELEVANCE_INSTRUCTION,
+                                         threshold=0.8, detail=True)
+              assert raw["results"] == []
+              assert raw["detail"]["documents"][0]["passes_threshold"] is False
 
           async def check_async():
               async with ranker() as reranker:
-                  assert (await reranker.a_rank("query", ["document"]))[0]["document_index"] == 0
-                  raw = await reranker.a_raw_rank("query", ["document"], detail=True)
+                  assert (await reranker.a_rerank("query", ["document"]))["results"][0]["document_index"] == 0
+                  assert (await reranker.a_relevance_rerank("query", ["document"]))["results"][0]["score"] == 0.5
+                  raw = await reranker.a_rerank("query", ["document"], detail=True)
                   assert raw["results"][0]["detail"]["original_length"] == 8
                   assert raw["detail"]["configuration"]["tokenizer"] is None
 

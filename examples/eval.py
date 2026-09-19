@@ -1,9 +1,14 @@
-r"""Evaluate rerankers on NanoBEIR-en/ja HotPotQA (50 queries, all hybrid candidates by default).
+r"""Evaluate rerankers on compatible Nano-set benchmarks (default: NanoBEIR-en / NanoHotpotQA).
 
 Run from this repository's root:
     # Jev: English, all original hybrid candidates (100/101 per query).
     # Set TYPESAFE_API_KEY in the environment or root .env; API calls incur usage.
     uv run --locked --group examples --extra tokenizer python examples/eval.py
+
+    # Relevance prompt, threshold 0.2, all positives included in 10 candidates.
+    uv run --locked --group examples --extra tokenizer python examples/eval.py --task relevance --top-k 10
+    # Standard reranking: --task rerank (default), threshold 0.0.
+    # Override either cutoff with --threshold 0.33. Kept scores satisfy >= cutoff.
 
     # Japanese, using every original hybrid candidate (100 or 101 per query).
     uv run --locked --group examples --extra tokenizer python examples/eval.py --target ja --top-k none
@@ -21,12 +26,15 @@ Run from this repository's root:
 Installation:
     The checkout's all extra includes tokenizer dependencies, Sentence Transformers
     (including PyTorch), and pyarrow. The commands above use this checkout's src/.
-    After the next release: uv add 'jev-reranker[all]'. Published 0.0.1 is scaffolding
-    only. Installing an extra does not download model weights; first use does.
+    For application use: uv add 'jev-reranker[all]'. The evaluation script itself
+    runs from a checkout. Model weights are downloaded on first use, not installation.
 
 Candidates and targets:
     --target en (default) or ja selects a pinned dataset revision; --split defaults
-    to NanoHotpotQA. --dataset requires --revision for a custom compatible dataset.
+    to NanoHotpotQA. Use --split for another benchmark. --dataset requires --revision
+    for another compatible dataset repository. The loader requires 50 queries,
+    100/101 hybrid candidates each, and positive-only qrels in the preset parquet layout.
+    Browse Nano-set datasets: https://huggingface.co/hakari-bench/datasets?search=nano
     --top-k defaults to none (no candidate limit). A positive count includes ALL
     qrels positives and fills
     remaining slots with the highest hybrid-ranked negatives. Positives outside the
@@ -37,7 +45,11 @@ Candidates and targets:
     --seed changes this shuffle. The evaluation cutoff remains nDCG@10 at any pool size.
 
 Backend settings:
-    Jev defaults: listwise, Gemma tokenizer, 4000 tokens per document, concurrency 4.
+    Jev defaults: rerank task (threshold 0.0), listwise, Gemma tokenizer,
+    4000 tokens per document, concurrency 4. --task relevance selects the evidence
+    prompt and defaults to threshold 0.2; pairwise is not supported for this task.
+    --task relevance and --threshold are Jev-only. CrossEncoder logits are not
+    probability scores and remain unfiltered by this example.
     Model: --model, then JEV_MODEL from environment/.env, then jev-latest.
     Environment credentials take precedence over root .env.
     Sentence Transformers defaults: BAAI/bge-reranker-v2-m3, automatic device,
@@ -50,12 +62,17 @@ Metrics and output:
     ndcg_at_10 uses ALL qrels positives for its ideal ranking, averaged over 50 queries.
     candidate_ndcg_at_10 uses positives within the selected pool. They agree when all
     positives are included; unfiltered pools may have a lower attainable oracle score.
-    Logs record missing positives, scores, backend configuration, and length details.
+    nDCG is computed AFTER filtering; unfiltered_ndcg_at_10 records the same run
+    before filtering. The ideal denominator remains unchanged after filtering.
+    Logs record documents retained/removed, positives retained/removed, removal
+    rates, removed IDs, and empty results. Positive retention uses positives in
+    the input pool; missing retrieval positives are counted separately.
+    Filtering happens after all candidates are scored, so it does not save Jev calls.
     Data cache: .cache/hotpotqa/<dataset>/<split>/<revision>/.
     Results: .live-results/hotpotqa-<UTC>/{manifest.json, <query-id>.json, summary.json}.
     Logs contain document text and are gitignored. --output requires a new directory.
 
-See docs/eval.md for the full guide and examples/README.md for historical run records.
+See docs/eval.md for the full guide and examples/README.md for a short introduction.
 """
 
 from __future__ import annotations
@@ -346,7 +363,7 @@ class SentenceTransformersRanker:
             },
         }
 
-    async def a_raw_rank(self, query, docs, *, detail=True):
+    async def a_rerank(self, query, docs, *, detail=True):
         import asyncio
 
         # One model instance, serialized inference; batching happens in predict().
@@ -358,6 +375,22 @@ class SentenceTransformersRanker:
                 # Keep the model alive until its worker has actually finished.
                 await task
                 raise
+
+
+def filter_statistics(input_ids, retained_ids, relevant):
+    retained = set(retained_ids)
+    removed = [doc for doc in input_ids if doc not in retained]
+    removed_positive = [doc for doc in removed if doc in relevant]
+    return {
+        "documents_scored": len(input_ids),
+        "documents_retained": len(retained_ids),
+        "documents_removed": len(removed),
+        "positives_in_candidates": len(set(input_ids) & relevant),
+        "positives_retained": len(retained & relevant),
+        "positives_removed": len(removed_positive),
+        "removed_document_ids": removed,
+        "removed_positive_ids": removed_positive,
+    }
 
 
 async def evaluate(args, root):
@@ -383,6 +416,8 @@ async def evaluate(args, root):
     jobs = prepare_jobs(queries, hybrid, qrels, args.seed, args.top_k)
     manifest = {
         "backend": args.backend,
+        "task": args.task,
+        "threshold": args.threshold,
         "dataset": args.dataset,
         "revision": args.revision,
         "split": args.split,
@@ -431,21 +466,52 @@ async def evaluate(args, root):
         async def run(job):
             qid, selected, shuffled = job
             async with semaphore:
-                raw = await reranker.a_raw_rank(
-                    queries[qid],
-                    [corpus[d] for d in shuffled],
-                    detail=True,
-                )
+                if args.backend == "jev":
+                    method = (
+                        reranker.a_relevance_rerank
+                        if args.task == "relevance"
+                        else reranker.a_rerank
+                    )
+                    raw = await method(
+                        queries[qid],
+                        [corpus[d] for d in shuffled],
+                        threshold=args.threshold,
+                        detail=True,
+                    )
+                    all_results = sorted(
+                        raw["detail"]["documents"],
+                        key=lambda r: (-r["score"], r["document_index"]),
+                    )
+                else:
+                    raw = await reranker.a_rerank(
+                        queries[qid],
+                        [corpus[d] for d in shuffled],
+                        detail=True,
+                    )
+                    all_results = raw["results"]
+            all_indices = [r["document_index"] for r in all_results]
+            if sorted(all_indices) != list(range(len(shuffled))):
+                raise ValueError(f"Incomplete or duplicate scores for {qid}")
             indices = [r["document_index"] for r in raw["results"]]
-            if sorted(indices) != list(range(len(shuffled))):
-                raise ValueError(f"Incomplete or duplicate results for {qid}")
+            expected = [
+                r["document_index"]
+                for r in all_results
+                if args.threshold is None or r["score"] >= args.threshold
+            ]
+            if indices != expected:
+                raise ValueError(f"Filtered results disagree with threshold for {qid}")
             ranking = [shuffled[i] for i in indices]
+            full_ranking = [shuffled[i] for i in all_indices]
+            filtering = filter_statistics(shuffled, ranking, qrels[qid])
             selected_relevant = qrels[qid].intersection(selected)
             if args.top_k is not None and selected_relevant != qrels[qid]:
                 raise ValueError(f"Selected documents omit positives for {qid}")
             row = {
                 "query_id": qid,
                 "ranking": ranking,
+                "unfiltered_ranking": full_ranking,
+                "filtering": filtering,
+                "unfiltered_ndcg_at_10": ndcg(full_ranking, qrels[qid]),
                 "ndcg_at_10": ndcg(ranking, qrels[qid]),
                 "candidate_ndcg_at_10": ndcg(ranking, selected_relevant),
                 "hybrid_ndcg_at_10": ndcg(selected, qrels[qid]),
@@ -463,7 +529,11 @@ async def evaluate(args, root):
                 json.dumps(row, ensure_ascii=False, indent=2)
             )
             rows.append(row)
-            print(f"{len(rows):2}/50 {qid} nDCG@10={row['ndcg_at_10']:.6f}", flush=True)
+            print(
+                f"{len(rows):2}/50 {qid} nDCG@10={row['ndcg_at_10']:.6f} "
+                f"kept={len(ranking)}/{len(shuffled)} positives_removed={filtering['positives_removed']}",
+                flush=True,
+            )
 
         tasks = [asyncio.create_task(run(job)) for job in jobs]
         try:
@@ -473,9 +543,35 @@ async def evaluate(args, root):
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             raise
+    totals = {
+        key: sum(row["filtering"][key] for row in rows)
+        for key in (
+            "documents_scored",
+            "documents_retained",
+            "documents_removed",
+            "positives_in_candidates",
+            "positives_retained",
+            "positives_removed",
+        )
+    }
+    totals["document_removal_rate"] = (
+        totals["documents_removed"] / totals["documents_scored"]
+    )
+    totals["positive_retention_rate"] = (
+        totals["positives_retained"] / totals["positives_in_candidates"]
+        if totals["positives_in_candidates"]
+        else None
+    )
+    totals["queries_with_removed_positives"] = sum(
+        bool(row["filtering"]["positives_removed"]) for row in rows
+    )
+    totals["empty_result_queries"] = sum(not row["ranking"] for row in rows)
     summary = {
         "query_count": len(rows),
+        "filtering": totals,
         "backend": args.backend,
+        "task": args.task,
+        "threshold": args.threshold,
         "dataset": args.dataset,
         "split": args.split,
         "queries_missing_positives": sum(bool(r["missing_positive_ids"]) for r in rows),
@@ -491,6 +587,7 @@ async def evaluate(args, root):
             key: mean(row[key] for row in rows)
             for key in (
                 "ndcg_at_10",
+                "unfiltered_ndcg_at_10",
                 "candidate_ndcg_at_10",
                 "hybrid_ndcg_at_10",
                 "shuffled_ndcg_at_10",
@@ -511,6 +608,18 @@ def main():
     root = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        "--task",
+        choices=("rerank", "relevance"),
+        default="rerank",
+        help="Jev prompt preset; relevance retains supporting evidence",
+    )
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=None,
+        help="Jev score cutoff: rerank default 0.0, relevance default 0.2",
     )
     parser.add_argument(
         "--backend", choices=("jev", "sentence-transformers"), default="jev"
@@ -578,6 +687,18 @@ def main():
         / ("hotpotqa-" + datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")),
     )
     args = parser.parse_args()
+    if args.backend == "sentence-transformers":
+        if args.task != "rerank" or args.threshold is not None:
+            parser.error(
+                "--task relevance and --threshold are Jev-only; CrossEncoder uses raw logits"
+            )
+    else:
+        if args.task == "relevance" and args.mode == "pairwise":
+            parser.error("Relevance scoring requires listwise or pointwise")
+        if args.threshold is None:
+            args.threshold = 0.2 if args.task == "relevance" else 0.0
+        if not 0 <= args.threshold <= 1:
+            parser.error("--threshold must be finite and between 0 and 1")
     if args.dataset is not None and args.revision is None:
         parser.error("--dataset requires --revision")
     target_dataset, target_revision = TARGETS[args.target]
@@ -618,13 +739,27 @@ def test_evaluation_maps_shuffled_indices_and_writes_complete_run(
 
     def respond(request):
         body = json.loads(request.content)
+        is_relevance = next(iter(body["questions"].values()))[
+            "instructions"
+        ].startswith(("Score how useful", "How useful is"))
+        if "document" in body["state"] and is_relevance:
+            assert body["questions"]["relevant"]["criteria"] == (
+                jev_reranker.POINTWISE_RELEVANCE_INSTRUCTION["criteria"]
+            )
+        documents = body["state"].get("documents")
+        if documents is None:
+            documents = {"relevant": body["state"]["document"]}
+        positive_score = 0.1 if is_relevance else 1.0
         return httpx.Response(
             200,
             json={
                 "model": "offline",
                 "answers": {
-                    key: {"type": "noul", "noul": float(text == "document 99")}
-                    for key, text in body["state"]["documents"].items()
+                    key: {
+                        "type": "noul",
+                        "noul": positive_score if text == "document 99" else 0.0,
+                    }
+                    for key, text in documents.items()
                 },
                 "usage": {"input_tokens": 1, "output_tokens": 1},
             },
@@ -644,6 +779,8 @@ def test_evaluation_maps_shuffled_indices_and_writes_complete_run(
     )
     args = argparse.Namespace(
         backend="jev",
+        task="rerank",
+        threshold=0.0,
         cache=tmp_path,
         revision=REVISION,
         dataset=DATASET,
@@ -657,18 +794,47 @@ def test_evaluation_maps_shuffled_indices_and_writes_complete_run(
         tokenizer="none",
         document_max_length=4000,
     )
-    for count in (10, None):
-        args.top_k = count
-        args.output = tmp_path / f"run-{count}"
+    for count, task, threshold, mode in (
+        (10, "rerank", 0.0, "listwise"),
+        (None, "rerank", 0.0, "listwise"),
+        (10, "relevance", 0.2, "listwise"),
+        (10, "relevance", 0.1, "listwise"),
+        (10, "relevance", 0.2, "pointwise"),
+        (10, "relevance", 0.1, "pointwise"),
+    ):
+        args.top_k, args.task, args.threshold, args.mode = count, task, threshold, mode
+        args.output = tmp_path / f"run-{count}-{task}-{threshold}-{mode}"
         asyncio.run(evaluate(args, root))
         summary = json.loads((args.output / "summary.json").read_text())
+        loses_positive = task == "relevance" and threshold == 0.2
         assert summary["query_count"] == 50
-        assert summary["ndcg_at_10"] == 1
+        assert summary["ndcg_at_10"] == (0 if loses_positive else 1)
+        assert summary["unfiltered_ndcg_at_10"] == 1
         assert summary["positive_promoted_queries"] == (50 if count else 0)
         assert summary["candidate_count_min"] == (10 if count else 100)
         assert summary["candidate_count_max"] == (10 if count else 101)
         assert len(list(args.output.glob("*.json"))) == 52
-        assert json.loads((args.output / "0.json").read_text())["ranking"][0] == "99"
+        assert summary["filtering"]["positives_removed"] == (
+            50 if loses_positive else 0
+        )
+        assert summary["filtering"]["positive_retention_rate"] == (
+            0 if loses_positive else 1
+        )
+        assert summary["filtering"]["empty_result_queries"] == (
+            50 if loses_positive else 0
+        )
+        if task == "rerank":
+            assert summary["filtering"]["documents_removed"] == 0
+        else:
+            assert summary["filtering"]["documents_retained"] == (
+                0 if loses_positive else 50
+            )
+        row = json.loads((args.output / "0.json").read_text())
+        if loses_positive:
+            assert row["ranking"] == []
+            assert row["filtering"]["removed_positive_ids"] == ["99"]
+        else:
+            assert row["ranking"][0] == "99"
 
 
 def test_cross_encoder_scores_keep_input_mapping_and_validate():
@@ -733,7 +899,7 @@ def test_sentence_transformers_adapter_without_gpu_or_api(monkeypatch):
 
     async def run():
         async with SentenceTransformersRanker(args) as ranker:
-            raw = await ranker.a_raw_rank("query", ["negative", "positive"])
+            raw = await ranker.a_rerank("query", ["negative", "positive"])
         assert raw["results"][0] == {"document_index": 1, "score": 2.0}
         assert raw["detail"]["truncated_pairs"] == 1
         assert raw["detail"]["configuration"]["resolved_revision"] == "resolved-sha"
@@ -758,6 +924,37 @@ def test_cli_default_has_no_candidate_limit(monkeypatch):
         monkeypatch.setattr(sys, "argv", ["eval.py", *options])
         main()
     assert seen == [None, 10, None]
+
+
+def test_filter_statistics_separates_retrieval_misses_from_removed_positives():
+    stats = filter_statistics(["a", "b", "c"], ["b"], {"a", "b", "outside"})
+    assert stats["documents_removed"] == 2
+    assert stats["positives_in_candidates"] == 2
+    assert stats["positives_retained"] == 1
+    assert stats["positives_removed"] == 1
+    assert stats["removed_positive_ids"] == ["a"]
+    assert stats["removed_document_ids"] == ["a", "c"]
+    assert filter_statistics(["a"], [], {"a"})["positives_removed"] == 1
+    assert filter_statistics(["a"], ["a"], {"a"})["documents_removed"] == 0
+
+
+def test_cli_task_threshold_defaults_and_overrides(monkeypatch):
+    import sys
+
+    seen = []
+
+    async def capture(args, root):
+        seen.append((args.task, args.threshold))
+
+    monkeypatch.setitem(main.__globals__, "evaluate", capture)
+    for options in (
+        [],
+        ["--task", "relevance"],
+        ["--task", "relevance", "--threshold", "0.33"],
+    ):
+        monkeypatch.setattr(sys, "argv", ["eval.py", *options])
+        main()
+    assert seen == [("rerank", 0.0), ("relevance", 0.2), ("relevance", 0.33)]
 
 
 if __name__ == "__main__":

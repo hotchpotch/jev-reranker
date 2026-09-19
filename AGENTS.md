@@ -4,12 +4,33 @@
 
 - `jev-reranker` is a Python library; the import name is `jev_reranker`.
 - Use Python 3.11 or newer and uv. Keep source code under `src/jev_reranker/`.
-- The initial `0.0.1` release contains package scaffolding only. Do not describe
-  reranking functionality as implemented until it exists.
+- The initial `0.0.1` release contains package scaffolding only. Distinguish that historical
+  release from the implemented functionality in the development branch.
 - Keep runtime dependencies minimal and development tools in the `dev` group.
 - Preserve the one-week uv cooldown (`exclude-newer = "1 week"`) and commit
   `uv.lock` with dependency changes.
 - Do not commit virtual environments, caches, build artifacts, or credentials.
+
+## Public Documentation
+
+- Write all documentation committed to Git in English, including `AGENTS.md`,
+  README files, specifications, guides, release notes, and explanatory comments
+  and docstrings in examples.
+- Preserve intentional multilingual test data and input fixtures.
+- Write for readers outside the development environment. Do not include personal
+  absolute paths, private hostnames, Tailscale URLs, or links to unpublished logs.
+  Repository-relative paths documenting actual inputs and outputs are appropriate.
+- Lead README with evidence selection for RAG, followed by runnable usage examples.
+  Keep detailed API reference material inside collapsed `<details>` blocks.
+- Use the canonical `rerank()` / `relevance_rerank()` names and their `a_` async
+  equivalents. Examples consume the `results` response envelope and rely on
+  automatic per-call HTTP cleanup.
+- Describe the current API in usage guides. Keep historical release limitations
+  in versioned release notes, not in the getting-started path.
+- Keep evaluation documentation focused on running the script and interpreting
+  metrics. Publish measured benchmark results separately, not in README or guides.
+- Use supported behavior and reproducible commands; do not turn model-specific
+  observations into general quality, retention, latency, or cost guarantees.
 
 ## Validation
 
@@ -59,7 +80,7 @@ with local validation; it runs on main pushes, pull requests, and manual dispatc
 - Keep historical release logs accurate; do not include later changes in an
   already released version's notes.
 - `python scripts/release-notes.py vX.Y.Z` generates the GitHub Release body.
-  Match the reference project's selection rule: use a nonempty `HEAD.md` first,
+  Use a nonempty `HEAD.md` first,
   then the versioned file, then `Release vX.Y.Z` as a fallback. Preserve Markdown
   paragraph spacing. Keep `tests/test_release_notes.py` aligned with this rule.
 - Before tagging, ensure `HEAD.md` is reset and the versioned release log is

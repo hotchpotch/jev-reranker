@@ -4,7 +4,7 @@ version = "0.0.1"
 description = "Multilingual Jev reranking with listwise, pointwise, and pairwise scoring"
 readme = "README.md"
 license = "MIT"
-license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
 dependencies = [
     "httpx>=0.28,<1",

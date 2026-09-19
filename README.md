@@ -1,281 +1,512 @@
-# jev-reranker
+# jev-reranker: Reranking and Relevance Filtering for RAG
 
-TypeSafe Jev による、多言語対応の Python reranker。`listwise`、`pointwise`、`pairwise` を選べ、長さに応じた分割、retry、実行内容を記録する detail に対応します。Python 3.11 以上が必要です。
+[![CI](https://github.com/hotchpotch/jev-reranker/actions/workflows/ci.yml/badge.svg)](https://github.com/hotchpotch/jev-reranker/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/jev-reranker.svg)](https://pypi.org/project/jev-reranker/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-以下は次回リリース向けの開発版の説明です。公開済み `0.0.1` はパッケージ構成のみです。
+**A Python reranker and relevance rerank filter powered by TypeSafe.AI's Jev.**
+It includes prompts for ranking and evidence selection, bounded concurrent
+execution, automatic splitting of long candidate lists, and retries—so you can
+use Jev in a retrieval pipeline without building the request handling yourself.
 
-## インストールと認証
+Search results can match a question without helping answer it. Passing every
+match to an LLM adds input tokens and potentially distracting context.
+`relevance_rerank()` scores documents for their usefulness as evidence, sorts
+them, and removes those below a configurable threshold. If nothing passes,
+your application can try another search or stop before generation.
 
-この checkout からインストールします。
+Use it after retrieval and before assembling context for RAG. Use `rerank()`
+when you want to reorder candidates without filtering by default. Both accept
+a query string and a list of document strings; scoring runs through the Jev API.
+The base package needs no local model or GPU.
+
+## Highlights
+
+- **Select useful evidence.** Relevance prompts credit direct
+  answers, partial answers, and concrete facts needed for multi-hop reasoning.
+- **Control what reaches generation.** Keep scores at or above your threshold,
+  optionally cap the results, and handle an empty result set explicitly.
+- **Define usefulness for your application.** Customize the instruction and
+  true/false criteria with an ordinary Python dictionary.
+- **Handle large candidate pools.** Automatic listwise splitting and configurable
+  document limits use character counts, an optional tokenizer, or your own counter.
+- **Integrate with sync or async code.** Concurrent requests, transient-error
+  retries, and automatic HTTP cleanup are built in. Choose shared-context
+  listwise scoring or independent pointwise scoring.
+- **Inspect what was kept and dropped.** Optional execution details include all
+  candidate scores, prompts, model information, input lengths, usage, and retries.
+
+## Getting started
+
+Requires Python 3.11+ and a TypeSafe API key. Jev API usage is billed by the service.
 
 ```sh
-uv pip install .
-cp .env.sample .env
+uv add jev-reranker
+# Or: pip install jev-reranker
 ```
 
-`.env` の `TYPESAFE_API_KEY` を設定するか、同名の環境変数を設定してください。
-明示的な `api_key=` が最優先で、次に環境変数、最後に `.env` の値を使用します。
-`.env` は Git 対象外です。`dotenv_path=None` でファイル読み込みを無効にできます。
+Replace `YOUR-TYPESAFE-API-KEY...` in the examples with your TypeSafe API key.
+You can also omit `api_key` and set `TYPESAFE_API_KEY` in the environment or `.env`.
+Keep real API keys out of version control.
+Save either example below as `example.py` and run `uv run python example.py`.
 
-既定では Python の `len(text)` で文字数を数えます。tokenizer の依存パッケージやダウンロードは不要です。
-
-追加依存は用途に応じて選べます。次版公開後は `uv add 'jev-reranker[all]'` で tokenizer・Sentence Transformers（PyTorch を含む）・評価用 pyarrow をまとめて導入できます。現時点の checkout では以下を使います。
-
-```sh
-uv sync --locked --extra all
-# tokenizer のみ: uv sync --locked --extra tokenizer
-# Sentence Transformers のみ: uv sync --locked --extra sentence-transformers
-```
-
-通常インストールには PyTorch は入りません。モデルの重みは extra のインストール時ではなく、使用時に取得します。
-
-## 使い方
+### Filter for useful evidence
 
 ```python
 from jev_reranker import JevReranker
 
-with JevReranker() as reranker:
-    results = reranker.rank(
-        "赤い惑星と呼ばれるのは？",
-        ["パンは小麦粉から作ります。", "Mars is known as the Red Planet."],
-        top_k=1,
-    )
-    print(results)
-    # [{"document_index": 1, "score": ..., "text": "Mars is known as the Red Planet."}]
+query = "How long do I have to return an online order to ACME Shop?"
+documents = [
+    "ACME Shop accepts online returns within 30 days of delivery.",
+    "For ACME Shop online orders, submit your return request within 30 days of receiving the item.",
+    "ACME Shop in-store purchases can be returned within 14 days of purchase.",
+    "ACME Shop products come with a one-year repair warranty.",
+    "FooBar Shop accepts online returns within 60 days of delivery.",
+]
+
+reranker = JevReranker(api_key="YOUR-TYPESAFE-API-KEY...")
+evidence = reranker.relevance_rerank(query, documents, threshold=0.2)
+
+for item in evidence["results"]:
+    print(f"{item['score']:.2f}  {item['text']}")
 ```
 
-`rank()` と `rerank()` は同じ API で、`raw_rerank()` の `results` を返す wrapper です。
-`document_index` は元の入力リストの0始まり index。スコア降順、同点は入力順で返します。
-重複テキストも独立した候補として扱い、`text` は切り詰め前の原文です。
-`return_documents=False` で本文を省略できます。`top_k` は結果の件数を制限し、採点対象は変更しません。
-空の文書リストと `top_k=0` は通信なしで空結果を返します。
+Example output (scores can vary by model and input context):
 
-## 長さの数え方と上限
+```text
+0.98  ACME Shop accepts online returns within 30 days of delivery.
+0.97  For ACME Shop online orders, submit your return request within 30 days of receiving the item.
+```
 
-`document_max_length` の既定値は **4000** です。標準では `len(text)`、つまり Unicode code point 数で数えます（バイト数や画面上の文字幅ではありません）。上限を超える文書は先頭部分を送信し、返却する `text` は原文のままです。
+Only the two passages about ACME Shop online returns remain. The in-store return,
+repair warranty, and FooBar Shop passages fall below the 0.2 threshold and are omitted.
+This example uses the default listwise mode; it does not limit the output with
+`top_k`.
+
+Results are sorted by descending score. Each result also includes
+`document_index`, its position in the original input, so you can retrieve URLs or
+other metadata from your search results. If nothing passes the threshold,
+`evidence["results"]` is an empty list: your application can try another search or abstain.
+
+Lower thresholds retain more documents; higher thresholds are more selective.
+The default is **0.2**, with equality included. Validate your threshold on your
+own queries: useful evidence can be removed, and irrelevant text can survive.
+Filtering can reduce the context sent to a downstream model, but it happens after
+Jev scores the candidates and does not reduce that scoring work. It does not by
+itself guarantee factual answers.
+
+### Rerank without filtering
 
 ```python
-with JevReranker(document_max_length=8000) as reranker:
-    results = reranker.rank("query", ["document"])
-# document_max_length=None なら文書の切り詰めを無効化
+from jev_reranker import JevReranker
+
+reranker = JevReranker(api_key="YOUR-TYPESAFE-API-KEY...")
+results = reranker.rerank(
+    "Which planet is called the Red Planet?",
+    ["Venus has a thick atmosphere.", "Mars is known as the Red Planet."],
+    top_k=1,
+)
+
+for item in results["results"]:
+    print(item["document_index"], item["score"], item["text"])
 ```
 
-**実環境では tokenizer の利用を推奨します。** 特に英語では文字数が token 数より大きくなりやすく、文字数基準だと必要以上に早く文書を切り詰めたり、リクエストを分割したりする可能性があります。
-Gemma tokenizer を使う場合は、この checkout の追加依存をインストールします。
+`rerank()` defaults to **threshold 0.0**, keeping all scored candidates unless you
+set `top_k` or raise the threshold. Each call closes its HTTP client automatically,
+including on failure; no context manager or explicit cleanup is needed.
+
+## Choosing between reranking and relevance filtering
+
+| Method | Intended use | Default threshold |
+| --- | --- | ---: |
+| `rerank()` | Order retrieved documents by relevance | 0.0 |
+| `relevance_rerank()` | Select evidence that can help answer the query | 0.2 |
+
+The two methods share the same scoring pipeline. They differ in their default
+instructions and threshold, not in the underlying model. The relevance prompt
+credits concrete partial and linking facts rather than requiring every document
+to contain a complete answer. The [built-in prompts](src/jev_reranker/instructions.py) are ordinary dictionaries
+you can replace with instructions for your application. Scores are not guaranteed
+to be calibrated across queries, models, or scoring modes; evaluate your threshold
+on representative data.
+
+## API reference
+
+Expand the sections below for signatures, options, and examples. Code snippets
+that only show configuration assume `from jev_reranker import JevReranker`.
+
+<details>
+<summary><strong>Requests, responses, and selection</strong></summary>
+
+```text
+rerank(query, documents, *, instruction=None, threshold=0.0,
+       top_k=None, return_documents=True, detail=False)
+relevance_rerank(query, documents, *, instruction=None, threshold=0.2,
+                 top_k=None, return_documents=True, detail=False)
+```
+
+`query` is a string and `documents` is a sequence of strings. The library accepts
+text documents, not image payloads. All ranking methods return a dictionary
+with a `results` list. The following is an illustrative shape, not a measured score:
+
+```python
+{"results": [{"document_index": 1, "score": 0.9, "text": "Original document text"}]}
+```
+
+With `detail=True`, every method adds a top-level `detail` with the complete
+execution record, and each returned result also contains document-level details.
+If every candidate is filtered out, the response still contains `"results": []`
+and the requested top-level details, including excluded documents.
+
+| Argument | Behavior |
+| --- | --- |
+| `instruction` | Override the prompt with an instructions/criteria dictionary |
+| `threshold` | Keep `score >= threshold`; finite number in [0, 1] |
+| `top_k` | None for all eligible results, or a nonnegative output limit |
+| `return_documents` | Include original text by default; False omits it |
+| `detail` | Include diagnostics; False by default |
+
+Sort by descending score, preserving input order for ties. Duplicate texts remain
+separate candidates. Text in results is untruncated. Apply the threshold before
+`top_k`; top-k does not reduce scoring work. Empty input and `top_k=0` make no
+requests. Unknown kwargs and invalid inputs raise errors rather than being ignored.
+
+`relevance_rerank()` supports listwise and pointwise, not pairwise.
+
+For full relevance diagnostics, request details:
+
+```python
+from jev_reranker import JevReranker
+
+reranker = JevReranker(api_key="YOUR-TYPESAFE-API-KEY...")
+response = reranker.relevance_rerank(
+    "Which planet is called the Red Planet?",
+    ["Mars is called the Red Planet.", "Bread is made from flour."],
+    threshold=0.2,
+    detail=True,
+)
+```
+
+`response["detail"]["documents"]` includes excluded scores and `passes_threshold`.
+`response["detail"]["selection"]` records counts before and after selection.
+
+</details>
+
+<details>
+<summary><strong>Authentication and optional dependencies</strong></summary>
+
+Install from PyPI:
 
 ```sh
-uv pip install '.[tokenizer]'
+uv add jev-reranker
+# Or: pip install jev-reranker
 ```
+
+Set `TYPESAFE_API_KEY` in `.env` or the environment. An explicit `api_key=` takes precedence over the environment, which takes precedence over `.env`. Keep `.env` out of version control. Set `dotenv_path=None` to disable file loading.
+
+By default, lengths use Python's `len(text)`; no tokenizer dependencies or downloads are required. Select extras as needed:
+
+```sh
+uv add 'jev-reranker[all]'
+# Tokenizer only: uv add 'jev-reranker[tokenizer]'
+# Sentence Transformers only: uv add 'jev-reranker[sentence-transformers]'
+```
+
+The `all` extra installs tokenizer dependencies, Sentence Transformers (including PyTorch), and evaluation-only pyarrow. The base installation does not include PyTorch. Model weights are downloaded when used, not when installing the extra.
+
+Use `api_key_env=` to read a different environment variable name.
+
+</details>
+
+<details>
+<summary><strong>Custom instructions</strong></summary>
+
+`relevance_rerank()` selects its preset by mode: the default `listwise` uses
+`RELEVANCE_INSTRUCTION`; explicit `pointwise` uses `POINTWISE_RELEVANCE_INSTRUCTION`.
+The latter judges each document without assuming access to other candidates.
+Both default to threshold 0.2, and an explicit per-call `instruction=` takes precedence.
+`rerank()` uses its own ranking prompt.
 
 ```python
-with JevReranker(
-    tokenizer="google/embeddinggemma-300m",
-    document_max_length=8000,   # この場合は8000 token。省略時は4000 token
-    split_state_budget=26000,
-    split_request_budget=48000,
-) as reranker:
-    results = reranker.rank("query", ["document"])
+from jev_reranker import JevReranker
+
+reranker = JevReranker(api_key="YOUR-TYPESAFE-API-KEY...", mode="pointwise")
+results = reranker.relevance_rerank(
+    "Which planet is called the Red Planet?",
+    ["Mars is called the Red Planet.", "Bread is made from flour."],
+)
 ```
 
-初回の採点時に tokenizer だけを取得します。Gemma の利用条件への同意と Hugging Face 認証（`HF_TOKEN` など）が必要になる場合があります。重み・PyTorch・GPU は不要です。既定 Gemma revision は固定され、`split_tokenizer_revision="main"` などで変更できます。別の Hub repo、ローカル tokenizer.json、`encode(text)` / `decode(ids)` を持つオブジェクトにも差し替えられます。独自オブジェクトを使う場合、ライブラリ側の tokenizer extra は不要です。
+For execution details, call `relevance_rerank(..., detail=True)`. The method
+selects the pointwise preset automatically on a pointwise instance. The dedicated
+preset adapts independent-evidence instructions to a single-document context;
+it does not imply calibrated scores or guaranteed positive retention. Tune thresholds on your own data.
 
-任意の同期 callable `length_fn: Callable[[str], int]` も受け取れます。例えば UTF-8 のバイト数を基準にできます。
+`RERANK_INSTRUCTION`, `PAIRWISE_INSTRUCTION`, `RELEVANCE_INSTRUCTION`, and `POINTWISE_RELEVANCE_INSTRUCTION` in [`instructions.py`](src/jev_reranker/instructions.py) are ordinary dictionaries. You can provide the same structure:
 
 ```python
-def utf8_length(text: str) -> int:
-    return len(text.encode("utf-8"))
-
-with JevReranker(length_fn=utf8_length, document_max_length=8000) as reranker:
-    results = reranker.rank("query", ["document"])  # 最大8000 bytes の prefix
+custom = {
+    "instructions": "Does {document} contain concrete evidence for `query`?",
+    "criteria": {
+        "true": "Contains concrete supporting facts",
+        "false": "Contains no supporting facts",
+    },
+}
+reranker = JevReranker(api_key="YOUR-TYPESAFE-API-KEY...")
+results = reranker.rerank("query", ["document"], instruction=custom, threshold=0.3)
+# JevReranker(api_key="YOUR-TYPESAFE-API-KEY...", instruction=custom) sets the instance default.
 ```
 
-関数は決定的な非負整数を返すものとし、`tokenizer` と併用しません。worker thread から呼ばれることがあります。文書と JSON 化した state/questions/request の予算判定に同じ関数を使うため、通常の文書以外の文字列も受け取ります。独自関数では文字列の prefix を二分探索して上限内に収めます。長さが単調増加しない関数では、最長の prefix は保証しません。
+Only the keys `instructions` and `criteria` are accepted. Criteria must contain nonempty `true` and `false` strings. Templates use `{document}`, or `{left}` and `{right}` for pairwise. Unknown keys and invalid placeholders fail before any request. Each call copies its instructions without mutating instance configuration, keeping concurrent calls separate. Legacy constructor arguments `instructions=` and `criteria=` remain supported but cannot be combined with constructor `instruction=`. `relevance_rerank()` selects the relevance preset independently of the constructor's ordinary ranking prompt; its per-call `instruction=` can override that preset.
 
-`split_state_budget`（既定26000）と `split_request_budget`（既定48000）も選んだ計測方法の単位です。query は切り詰めません。文字数・独自関数・Gemma token 数のいずれも Jev の内部 token 数との一致は保証せず、API の context 超過は別途処理します。
-旧名 `document_max_tokens` / `split_state_token_budget` / `split_request_token_budget` は互換 alias として受け付けますが、単位は同じく選択した計測方法に従います。
+</details>
 
-## 非同期 API
+<details>
+<summary><strong>Async calls, threads, and client lifecycle</strong></summary>
 
-内部の HTTP 通信は `httpx.AsyncClient` と `asyncio` で実行します。
-async アプリケーションからは次の API を直接 await できます。
+HTTP uses `httpx.AsyncClient` and `asyncio` internally:
 
 ```python
 import asyncio
 from jev_reranker import JevReranker
 
 async def main():
-    async with JevReranker(mode="pointwise", max_concurrency=8) as reranker:
-        results = await reranker.a_rank("赤い惑星は？", ["火星です。", "金星です。"])
-        raw = await reranker.a_raw_rank(
-            "赤い惑星は？", ["火星です。", "金星です。"], detail=True,
-        )
-        # 同じ instance で複数 query を並行処理できる
-        batches = await asyncio.gather(
-            reranker.a_rank("赤い惑星は？", ["火星です。", "金星です。"]),
-            reranker.a_rank("地球の衛星は？", ["月です。", "太陽です。"]),
-        )
-        print(results, raw["detail"]["usage"], batches)
+    reranker = JevReranker(api_key="YOUR-TYPESAFE-API-KEY...", mode="pointwise", max_concurrency=8)
+    results = await reranker.a_rerank("The Red Planet?", ["Mars.", "Venus."])
+    response = await reranker.a_rerank(
+        "The Red Planet?", ["Mars.", "Venus."], detail=True,
+    )
+    # Concurrent queries can share the same instance.
+    batches = await asyncio.gather(
+        reranker.a_rerank("The Red Planet?", ["Mars.", "Venus."]),
+        reranker.a_rerank("Earth's satellite?", ["The Moon.", "The Sun."]),
+    )
+    print(results, response["detail"]["usage"], batches)
 
 asyncio.run(main())
 ```
 
-| 同期 API | 非同期 API | 返り値 |
+| Sync API | Async API | Return value |
 | --- | --- | --- |
-| `rank()` / `rerank()` | `a_rank()` / `a_rerank()` | 順位付き results のリスト |
-| `raw_rank()` / `raw_rerank()` | `a_raw_rank()` / `a_raw_rerank()` | results と省略可能な全体 detail |
-| `close()` / `with` | `await aclose()` / `async with` | HTTP 接続などの解放 |
+| `rerank()` | `a_rerank()` | Ranked results and optional execution details |
+| `relevance_rerank()` | `a_relevance_rerank()` | Results passing the relevance threshold and optional execution details |
+| `close()` / `with` (optional) | `await aclose()` / `async with` (optional) | Disable the instance and drain active calls |
 
-同期・非同期で引数と結果の構造は同じです。`top_k`、`return_documents`、`detail` も共通です。
-`a_rank()` は `a_raw_rank()` の wrapper、既存の同期 API も同じ非同期採点処理を利用します。
+Sync and async methods share arguments, result structure, and scoring logic, including `top_k`, `return_documents`, and `detail`.
 
-1つの instance は1つのイベントループに所属します。非同期 API は最初の利用時のループに結び付き、
-接続プールと Semaphore を再利用します。別の `asyncio.run()` へ持ち回らず、同じループ内で使って閉じてください。
-同期 API は instance ごとに1つの専用イベントループスレッドを遅延起動し、複数の同期呼び出し元スレッドから共有できます。
-同期用 instance と非同期用 instance は分けてください。稼働中のイベントループ内で同期 API を呼ぶと、
-ループをブロックさせずに `ConfigurationError` で非同期 API の利用を案内します。
+Ordinary instances can be reused across sync calls, caller threads, and async
+event loops. Each synchronous call uses a temporary `asyncio.run()` loop; no
+persistent loop thread is kept. Calling a sync method inside a running loop still
+raises `ConfigurationError`; use the async method instead.
 
-並行 HTTP 数は instance 全体で制限します。pointwise は worker task、pairwise は上限件数ごとの task、
-listwise の分割 chunk は逐次処理です。retry の待機は `asyncio.sleep` を使います。
-同期的な tokenizer のロード・計数は `asyncio.to_thread` に退避するため、HTTP 待機用スレッドは作りません。
+Each call owns a separate, lazily created HTTP client. Success, failure, and
+cancellation all close it before the call finishes. A context-local call state
+keeps concurrent requests separate. No explicit shutdown is needed for normal use.
 
-呼び出しをキャンセルすると、その呼び出し内の子タスクを回収して `asyncio.CancelledError` を伝播します。
-HTTP エラー時も子タスクを停止し、従来の `JevError` 系例外を保持します（ExceptionGroup に包みません）。
-`aclose()` / `close()` は新しい処理を拒否し、実行中の採点が終了してから所有する接続を閉じます。
-先に止めたい処理は、呼び出し側でタスクを cancel してから閉じてください。
+HTTP concurrency is bounded across the entire instance. Pointwise uses worker tasks, pairwise processes bounded groups of tasks, and listwise chunks run sequentially. Retries use `asyncio.sleep`. Synchronous tokenizer loading and counting use `asyncio.to_thread`.
 
-## モードと設定
+Cancellation drains child tasks before propagating `asyncio.CancelledError`. HTTP failures also drain children and preserve public `JevError` exceptions rather than wrapping them in `ExceptionGroup`. `aclose()` and `close()` remain optional compatibility methods: they reject new work and wait for active calls, whose resources are cleaned up automatically. Cancel caller tasks first if you need to stop active work early.
 
-| モード | 処理 | スコア |
-| --- | --- | --- |
-| `listwise`（既定） | 候補を同じ state で質問し、上限を超える場合は分割 | 文書ごとの Noul 関連確率 |
-| `pointwise` | query と1文書ごとに独立した質問 | 文書ごとの Noul 関連確率 |
-| `pairwise` | 全ペアを両方向で比較 | 相手に勝つ平均確率。絶対的な関連度ではない |
+</details>
+
+<details>
+<summary><strong>Length limits and optional tokenizers</strong></summary>
+
+`document_max_length` defaults to **4000**. The default `len(text)` counts Unicode code points, not bytes or display width. Documents exceeding the limit are sent as prefixes; returned text remains unchanged.
 
 ```python
-reranker = JevReranker(
-    model="jev-1.13.0",       # 既定 jev-latest。比較実験では固定バージョンを推奨
-    mode="listwise",
-    document_max_length=4000,  # None で文書の prefix 切り詰めを無効化
-    split_state_budget=26000,
-    split_request_budget=48000,
-    max_concurrency=4,
-    timeout=180.0,
-    max_retries=8,
-)
-# 使い終わったら reranker.close()
+reranker = JevReranker(api_key="YOUR-TYPESAFE-API-KEY...", document_max_length=8000)
+results = reranker.rerank("query", ["document"])
+# document_max_length=None disables document truncation.
 ```
 
-| constructor 引数 | 既定値・意味 |
-| --- | --- |
-| `model` | 明示値 → `JEV_MODEL`（環境/.env）→ `jev-latest` |
-| `api_key`, `api_key_env` | キーの明示値、検索する環境変数名（`TYPESAFE_API_KEY`） |
-| `dotenv_path` | `.env`。プロセスの環境変数は変更しない |
-| `endpoint` | 明示値 → `TYPESAFE_ENDPOINT` → `https://api.typesafe.ai/v1/systemone`。完全な endpoint URL |
-| `max_concurrency` | listwise=4、pointwise/pairwise=20。instance 全体の HTTP 同時実行上限 |
-| `timeout`, `max_retries` | 各 HTTP I/O 180秒、初回を除いて最大8 retry |
-| `split_tokenizer_name` | 既定 None。`tokenizer` の文字列指定と同等の別名 |
-| `split_tokenizer_revision` | 既定 Gemma は固定 commit。他の tokenizer は指定なしなら Hub 既定 revision |
-| `tokenizer_max_length` | 65536。渡された tokenizer の `model_max_length` が小さければ自動で引き上げる。既存の大きな値は維持 |
-| `tokenizer` | 既定 None。Hub repo、ローカル tokenizer.json または encode/decode オブジェクト |
-| `length_fn` | 既定 None（tokenizer 未指定なら `len`）。独自の同期計数関数 |
-| `document_max_length` | 4000。None で文書切り詰め無効 |
-| `split_state_budget`, `split_request_budget` | 26000 / 48000。選択した計測方法による上限 |
-| `instructions`, `criteria` | 質問 template と true/false の判定基準 |
-| `client` | 借用する `httpx.AsyncClient`。同じループで使う。ranker は閉じない。同期版 `httpx.Client` は不可 |
-| `transport` | `httpx.AsyncBaseTransport`（例: `httpx.MockTransport`）。ranker が所有して閉じる。client との併用不可 |
+**A tokenizer is recommended for production.** English character counts in particular can be much larger than token counts, causing unnecessarily early truncation or request splitting. Install the optional tokenizer dependencies:
 
-Gemma の長さ設定は **Jev の入力長を推定するため** のものです。EmbeddingGemma モデル本体の context を拡張しません。
-Gemma と Jev の token 数は同一とは限らず、query・question も予算を消費します。
-分割後の listwise は異なる候補の文脈で採点するため、分割前と同じスコアになる保証はありません。
-pairwise は n(n−1)/2 リクエストを使うため、小さな候補集合での相対比較に向きます。
-
-名前で指定した tokenizer は truncation/padding を自動で無効にし、65536 を超える入力も全体を計数します。オブジェクト指定では書き換え可能な `model_max_length` を `tokenizer_max_length` 以上へ自動調整します（渡したオブジェクト自体を変更）。上限属性のない独自 tokenizer はそのまま使います。これは tokenizer 側の設定であり、文書の送信上限 `document_max_length` は変更しません。
-
-独自 tokenizer は特殊 token を加えず、入力を切り詰めない encoder を用意してください。
-Transformers の tokenizer を渡す場合も、このインターフェースに合わせた wrapper で
-`add_special_tokens=False, truncation=False` を指定します。
-
-質問を変更する場合、listwise/pointwise は `{document}` を含めます。
-pairwise は `{left}` と `{right}` を含めます。これ以外の template フィールドや不明な kwargs はエラーになります。
+```sh
+uv add 'jev-reranker[tokenizer]'
+```
 
 ```python
 reranker = JevReranker(
+    api_key="YOUR-TYPESAFE-API-KEY...",
+    tokenizer="google/embeddinggemma-300m",
+    document_max_length=8000,  # 8000 tokens here; the default is 4000 tokens.
+    split_state_budget=26000,
+    split_request_budget=48000,
+)
+results = reranker.rerank("query", ["document"])
+```
+
+Only the tokenizer is fetched on first scoring. Gemma license acceptance and Hugging Face authentication such as `HF_TOKEN` may be required. No model weights, PyTorch, or GPU are needed. The default Gemma revision is pinned; override it with `split_tokenizer_revision="main"`, for example. Other Hub repositories, local `tokenizer.json` files, and objects implementing `encode(text)` / `decode(ids)` are supported. Supplying your own object does not require this library's tokenizer extra.
+
+You can also provide a synchronous `length_fn: Callable[[str], int]`, such as a UTF-8 byte counter:
+
+```python
+def utf8_length(text: str) -> int:
+    return len(text.encode("utf-8"))
+
+reranker = JevReranker(api_key="YOUR-TYPESAFE-API-KEY...", length_fn=utf8_length, document_max_length=8000)
+results = reranker.rerank("query", ["document"])  # Prefix of at most 8000 bytes.
+```
+
+The function must return a deterministic nonnegative integer and cannot be combined with `tokenizer`. It may run in a worker thread and receives both documents and serialized JSON state/questions/requests. Custom counters use binary search over text prefixes, followed by a bound check; the longest possible prefix is not guaranteed for nonmonotonic functions.
+
+`split_state_budget` (26000) and `split_request_budget` (48000) use the same selected units. Queries are not truncated. Character counts, custom counts, and Gemma tokens are not guaranteed to match Jev's internal tokens; API context errors are handled separately. Legacy names `document_max_tokens`, `split_state_token_budget`, and `split_request_token_budget` remain aliases and do not force token-based measurement.
+
+</details>
+
+<details>
+<summary><strong>Scoring modes and constructor options</strong></summary>
+
+| Mode | Operation | Score |
+| --- | --- | --- |
+| `listwise` (default) | Ask about candidates in a shared state; split when limits are exceeded | Per-document score from 0 to 1 |
+| `pointwise` | Ask independently for each query/document pair | Per-document score from 0 to 1 |
+| `pairwise` | Compare every pair in both directions | Mean win probability, not absolute relevance |
+
+```python
+reranker = JevReranker(
+    api_key="YOUR-TYPESAFE-API-KEY...",
+    model="jev-latest",  # Override to select another Jev model.
+    mode="listwise",
+    document_max_length=4000,  # None disables prefix truncation.
+    split_state_budget=26000,
+    split_request_budget=48000,
+)
+results = reranker.rerank("query", ["document"])
+```
+
+| Option | Meaning / default |
+| --- | --- |
+| `model` | Explicit value → `JEV_MODEL` (environment/`.env`) → `jev-latest` |
+| `api_key`, `api_key_env` | Explicit key and environment variable name (default `TYPESAFE_API_KEY`) |
+| `dotenv_path` | `.env`; does not mutate the process environment |
+| `endpoint` | Explicit value → `TYPESAFE_ENDPOINT` → `https://api.typesafe.ai/v1/systemone`; a complete endpoint URL |
+| `max_concurrency` | 4 for listwise, 20 for pointwise/pairwise; shared instance-wide HTTP limit |
+| `timeout`, `max_retries` | 180 seconds per HTTP I/O; up to 8 retries after the initial attempt |
+| `split_tokenizer_name` | None; alias for a string-valued `tokenizer` |
+| `split_tokenizer_revision` | Pinned commit for default Gemma; Hub default for other tokenizers unless specified |
+| `tokenizer_max_length` | 65536; automatically raises a smaller supplied `model_max_length` and preserves larger values |
+| `tokenizer` | None; Hub repository, local tokenizer.json, or encode/decode object |
+| `length_fn` | None (uses `len` without a tokenizer); custom synchronous counter |
+| `document_max_length` | 4000; None disables document truncation |
+| `split_state_budget`, `split_request_budget` | 26000 / 48000 in the selected measurement units |
+| `instruction` | Dictionary containing instructions/criteria; also accepted per call |
+| `instructions`, `criteria` | Legacy constructor template and criteria |
+| `client` | Advanced: borrowed `httpx.AsyncClient`; async methods only, on one loop; caller closes it |
+| `transport` | Advanced: borrowed `httpx.AsyncBaseTransport`, such as `httpx.MockTransport`; caller closes it; cannot be combined with `client` |
+
+Explicitly supplied clients and transports are caller-owned and are never closed
+by the reranker. A borrowed client intentionally overrides per-call connection
+ownership, remains bound to its first event loop, and requires async methods.
+Custom transports must support the caller's concurrency and loop usage. These
+advanced options are unnecessary for ordinary API calls.
+
+Gemma length settings estimate Jev input size; they do not extend the EmbeddingGemma model's context. Queries and questions also consume the budgets. Partitioned listwise scoring uses different shared contexts and is not guaranteed to produce the same scores as an unsplit request. Pairwise uses n(n−1)/2 requests and is most suitable for small candidate sets.
+
+Named tokenizers disable truncation and padding and count the full input even beyond 65536 tokens. Supplied objects with writable `model_max_length` are adjusted to at least `tokenizer_max_length`, mutating that object. Objects without this attribute are left unchanged. This does not change `document_max_length`.
+
+Custom encoders should not add special tokens or truncate input. Wrap Transformers tokenizers to pass `add_special_tokens=False, truncation=False`. Custom question templates must contain `{document}` for listwise/pointwise or `{left}` and `{right}` for pairwise. Other fields and unknown kwargs are rejected.
+
+```python
+reranker = JevReranker(
+    api_key="YOUR-TYPESAFE-API-KEY...",
     instructions="Does {document} directly answer `query`?",
     criteria={"true": "Provides the requested facts", "false": "Does not provide the requested facts"},
 )
 ```
 
-## 詳細ログとエラー
+</details>
+
+<details>
+<summary><strong>Execution details, retries, and errors</strong></summary>
 
 ```python
 import json
+from pathlib import Path
 from jev_reranker import JevError, JevReranker
 
-with JevReranker() as reranker:
-    try:
-        raw = reranker.raw_rerank("赤い惑星は？", ["火星です。", "金星です。"], detail=True)
-    except JevError as exc:
-        # APIError.status_code や、失敗までの exc.detail を調査できる
-        raise
+reranker = JevReranker(api_key="YOUR-TYPESAFE-API-KEY...")
+try:
+    response = reranker.rerank("The Red Planet?", ["Mars.", "Venus."], detail=True)
+except JevError as exc:
+    # Inspect APIError.status_code or partial execution details in exc.detail.
+    raise
 
-with open("rerank-log.json", "w", encoding="utf-8") as file:
-    json.dump(raw, file, ensure_ascii=False, indent=2)
+Path("rerank-log.json").write_text(
+    json.dumps(response, ensure_ascii=False, indent=2), encoding="utf-8",
+)
 ```
 
-`raw["detail"]` に実効設定、Python/依存バージョン、要求/解決モデル、tokenizer revision、
-usage、retry、分割、送信した state/questions と応答を記録します。
-`raw["results"][i]["detail"]` には `original_length` / `sent_length` / `length_unit`、対応 request ID、pairwise の比較結果が入ります。
-`rank(..., detail=True)` でも文書別 detail を取得できます。実行全体のログは `raw_rerank` を使ってください。
-detail の `schema_version` は2です。`usage.input_tokens` / `output_tokens` は API が返す実 token 数で、ローカルの長さ計測とは別です。
-ログには本文が含まれます。API キー・認証ヘッダー・任意の環境変数は保存しません。
+`response["detail"]` records effective settings, Python/dependency versions, requested/resolved models, tokenizer revision, usage, retries, splits, submitted state/questions, and responses. Per-result `detail` contains `original_length`, `sent_length`, `length_unit`, related request IDs, and pairwise comparisons. `rerank(..., detail=True)` and `relevance_rerank(..., detail=True)` return the same full execution record, including excluded documents.
 
-429/500/502/503/504/529 と transport error は指数 backoff と jitter で retry し、
-`Retry-After` を最大60秒まで尊重します。認証エラーや壊れた成功応答は retry しません。
-listwise の context 超過は失敗した候補群だけを再分割します。単一文書/ペアでも収まらなければ
-`ContextLimitError` になります。失敗を0点に置き換えることはありません。
-その他の公開例外は `ConfigurationError`、`APIError`、`ResponseValidationError`（共通基底 `JevError`）です。
+Detail `schema_version` is 2. `usage.input_tokens` and `output_tokens` are API-reported token counts, distinct from local length estimates. Logs include document text but exclude API keys, authentication headers, and arbitrary environment variables.
 
-constructor の設定は利用中に書き換えず、別設定には別 instance を作ってください。
+HTTP 429/500/502/503/504/529 and transport errors receive exponential backoff with jitter, respecting `Retry-After` up to 60 seconds. Authentication failures and malformed successful responses are not retried. Listwise context errors repartition only the failed candidates. A document or pair that cannot fit raises `ContextLimitError`. Failures are never converted to zero scores. Other public exceptions are `ConfigurationError`, `APIError`, and `ResponseValidationError`, all derived from `JevError`.
 
-## 開発と live E2E
+Do not mutate constructor settings during use; create another instance for different settings.
+
+</details>
+
+## Evaluation
+
+Evaluate relevance filtering or reranking on a Nano-set benchmark. Use the same
+candidate selection and metrics to compare Jev with a Sentence
+Transformers CrossEncoder, or inspect how a relevance threshold changes the
+retained documents and positives.
 
 ```sh
+uv run --locked --group examples --extra tokenizer python examples/eval.py \
+  --task relevance --target en
+```
+
+Run this command from a source checkout; `examples/eval.py` is a repository script.
+This example scores the full hybrid candidate pool. Add `--top-k 10` to evaluate
+a controlled ten-candidate pool containing every labeled positive. See the [evaluation guide](docs/eval.md) for dataset selection, dependencies,
+metrics, and output files. Evaluation calls the real Jev API and incurs usage charges.
+
+## Contributing
+
+Bug reports and contributions are welcome. For a ranking issue, include a minimal
+reproduction, the model and mode, and the behavior you expected. Remove credentials
+and private document text before sharing execution details.
+
+Contributor guides:
+
+- [Design and behavior](docs/spec.md)
+- [Live test setup](docs/live-validation.md)
+- [Repository guidelines](AGENTS.md)
+- [Release guide](docs/release.md) and [changelog](CHANGELOG.md)
+
+```sh
+git clone https://github.com/hotchpotch/jev-reranker.git
+cd jev-reranker
 uv sync --locked --dev
 uv run --locked tox
-# 明示指定した場合だけ、本物の .env / Jev / Gemma tokenizer で実行
-uv run --locked pytest tests/test_live.py --live -q
 ```
 
-通常の pytest / CI は live テストを skip し、外部通信や API キーを必要としません。
-live E2E は日英・中国語・スペイン語・混在言語の各4文書を3モードで採点し、
-同期・非同期 API の両方で期待する全順位と厳密なスコア順序を検査します。接続再利用の live 検査も含みます。実行ログは Git 対象外の `.live-results/` に保存します。
-成功結果・制約は [live 検証記録](docs/live-validation.md)、詳しい設計は [仕様](docs/spec.md) を参照してください。
+Normal tests do not call Jev. Live tests require explicit opt-in and credentials;
+see the live test guide before running them.
 
-uv の依存解決は公開後1週間の cooldown を維持しています。
+## References
 
-```sh
-uv build --no-sources --clear
-uv run --locked twine check --strict dist/*
-```
+### HAKARI-Bench
 
-公開は [リリース手順](docs/release.md) に従い、新バージョンを付けた reviewed PR とタグから行います。
-[CHANGELOG](CHANGELOG.md) / [次回リリースの変更](docs/releases/HEAD.md)。
+[HAKARI-Bench](https://github.com/hakari-bench/hakari-bench) is a related project
+by the same author. Its TypeSafe reranker implementation informed this library's
+Jev scoring and listwise partitioning design. Its Nano-set benchmark tooling also
+informed the evaluation example's hybrid candidate handling and nDCG calculation.
 
-## ライセンス
+The evaluation script uses compatible
+[Nano-set benchmarks](https://huggingface.co/hakari-bench/datasets?search=nano),
+with NanoBEIR-en / NanoHotpotQA as the default and a NanoBEIR-ja preset.
+See the [evaluation guide](docs/eval.md) for other datasets and splits, pinned
+revisions, and candidate selection rules.
 
-MIT。[LICENSE](LICENSE)、移植元の [権利表示](THIRD_PARTY_NOTICES.md) を参照してください。
+## License
 
-## HotPotQA の評価例
+MIT. See [LICENSE](LICENSE).
 
-[examples/eval.py](examples/eval.py) は NanoBEIR-en/ja の hybrid 全候補（既定100/101件）を seed 42でシャッフルして50 query の nDCG@10を計測します。`--top-k 10` を指定すると全正解を含む10文書に絞れます。`--target ja` で日本語、`--top-k none` で元の hybrid 全候補（正解補完なし）を評価できます。[Evaluation guide (English)](docs/eval.md) に実行手順と指標の定義、[実測記録](examples/README.md) に過去の結果をまとめています。
+## Author
 
-```sh
-uv run --locked --group examples --extra tokenizer python examples/eval.py
-```
-
-Sentence Transformers の CrossEncoder でも同じ入力・指標で評価できます（Jev API キー不要）。
-
-```sh
-uv run --locked --extra all python examples/eval.py --backend sentence-transformers \
-  --model BAAI/bge-reranker-v2-m3 --device cuda:1 --dtype float16 --target en --top-k 10
-```
+Yuichi Tateno ([@hotchpotch](https://github.com/hotchpotch)).
