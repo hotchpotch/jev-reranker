@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version-file: .python-version
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.12.0"
+          enable-cache: true
+      - name: Install dependencies
+        run: uv sync --locked --dev
+      - name: Check release tag
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          python - <<'PY'
+          import os
+          import tomllib
+          from pathlib import Path
+
+          version = tomllib.loads(Path("pyproject.toml").read_text())["project"]["version"]
+          tag = os.environ["GITHUB_REF_NAME"]
+          if tag != f"v{version}":
+              raise SystemExit(f"Tag {tag!r} does not match package version {version!r}")
+          PY
+      - name: Run tests, lint, and type checks
+        run: uv run --locked tox
+      - name: Build wheel and source distribution
+        run: uv build --no-sources
+      - name: Check package metadata
+        run: uv run --locked twine check --strict dist/*
+      - name: Smoke test installed wheel
+        run: |
+          uv venv /tmp/jev-reranker-wheel-test --python 3.11
+          uv pip install --python /tmp/jev-reranker-wheel-test/bin/python --no-deps dist/*.whl
+          cd /tmp
+          /tmp/jev-reranker-wheel-test/bin/python - <<'PY'
+          from importlib.metadata import version
+          import jev_reranker
+
+          print(f"Installed jev-reranker {version('jev-reranker')}: {jev_reranker.__file__}")
+          PY
+      - name: Upload distributions
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: distributions
+          path: dist/
+          if-no-files-found: error
