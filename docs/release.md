@@ -45,5 +45,5 @@ PyPI 公開後に GitHub Release 作成だけが失敗した場合は、失敗�
 公開直後の検証では、このプロジェクトの1週間 cooldown の対象外として明示的に指定します。
 
 ```sh
-uv run --no-project --exclude-newer-package jev-reranker=false --with jev-reranker==0.0.1 python -c 'import jev_reranker; from importlib.metadata import version; print(version("jev-reranker"))'
+uv run --isolated --no-project --exclude-newer-package jev-reranker=false --with jev-reranker==0.0.1 python -c 'import jev_reranker; from importlib.metadata import version; print(version("jev-reranker"))'
 ```
