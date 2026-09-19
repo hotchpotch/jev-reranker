@@ -122,13 +122,29 @@ including on failure; no context manager or explicit cleanup is needed.
 | `rerank()` | Order retrieved documents by relevance | 0.0 |
 | `relevance_rerank()` | Select evidence that can help answer the query | 0.2 |
 
-Both methods use the same Jev model and request handling. Each supplies a
-different prompt and default threshold. The relevance prompt accepts partial
-answers and linking facts: a passage can be useful without answering the whole
-question.
+The difference is the instruction and the default threshold. Both methods use
+the same Jev model and scoring pipeline; `relevance_rerank()` is not simply
+`rerank()` with a higher cutoff.
 
-You can read or replace the [built-in prompts](src/jev_reranker/instructions.py).
-A suitable threshold depends on your queries, prompt, model, and scoring mode.
+`rerank()` asks Jev to score how well each document helps answer the query, and
+keeps all scores by default (`threshold=0.0`). `relevance_rerank()` uses a prompt
+that explicitly asks for very low scores when a document only overlaps with the
+topic or provides no useful evidence. This is intended to push those scores much
+lower than ordinary reranking, making a threshold (`0.2` by default) more useful
+for removing documents before passing context to an LLM.
+
+That emphasis has a tradeoff. Pushing weak candidates toward zero can make their
+relative order less informative, so the relevance prompt may be less suitable
+than `rerank()` when the goal is to sort the entire candidate set. Use
+`relevance_rerank()` when deciding which documents to keep matters most; use
+`rerank()` when ordering the candidates is the main task. Both return results
+sorted by descending score.
+
+The relevance prompt still credits partial answers and concrete linking facts;
+a passage need not answer the whole question to be retained. Read the
+[built-in prompts](src/jev_reranker/instructions.py) and test the choice of prompt
+and threshold on your own data. Lower scores and better filtering are the intent
+of the instructions, not a guarantee for every document or query.
 
 ## API reference
 
@@ -219,13 +235,31 @@ Use `api_key_env=` to read a different environment variable name.
 </details>
 
 <details>
-<summary>Custom instructions</summary>
+<summary>Scoring instructions and customization</summary>
 
 `relevance_rerank()` selects its preset by mode: the default `listwise` uses
 `RELEVANCE_INSTRUCTION`; explicit `pointwise` uses `POINTWISE_RELEVANCE_INSTRUCTION`.
 The latter judges each document without assuming access to other candidates.
 Both default to threshold 0.2, and an explicit per-call `instruction=` takes precedence.
-`rerank()` uses its own ranking prompt.
+`rerank()` uses `RERANK_INSTRUCTION` for listwise and pointwise scoring.
+It asks whether a document helps answer the query and prefers specific facts,
+without prescribing numeric score anchors.
+
+The relevance presets add explicit anchors: topic overlap alone should receive
+0.1, and unrelated content or the wrong referent should receive 0.0. Useful
+partial answers and linking facts receive higher anchors. These instructions
+are designed to separate useful evidence from documents to discard, rather than
+preserve fine distinctions among weak candidates. As a result, they can work
+better for threshold filtering while being less suitable for ordering every
+candidate. Actual scores still depend on the model and context; the library
+does not force scores to these anchors or rescale them after the API response.
+
+The instruction controls scoring; the threshold controls selection after scoring.
+Changing `threshold` alone does not change the prompt or the scores. For example,
+`rerank(..., threshold=0.2)` keeps the ordinary ranking prompt, while
+`relevance_rerank(..., threshold=0.0)` keeps the relevance prompt and returns all
+scored candidates. For the same supported mode, explicit instruction, and
+threshold, both methods use the same scoring and selection logic.
 
 ```python
 from jev_reranker import JevReranker
