@@ -3,7 +3,20 @@
 `vX.Y.Z` タグの push で `.github/workflows/release.yml` を起動します。
 通常 CI と同じ pytest・ruff・ty、ビルド、メタデータ検査、wheel のインストール検査を通過後、
 PyPI へ公開し、同じ配布物を添付した GitHub Release を作成します。
-現在の `0.0.1` はパッケージ構成のみの初期リリースで、reranker の機能は未実装です。
+公開済み `0.0.1` はパッケージ構成のみの初期リリースです。開発版の reranker 実装を公開する際は新しいバージョンに進めます。
+CI は runtime 依存も含めた隔離 wheel install と、認証・ネットワーク不要の空入力 rank を検査します。
+
+公開前のローカル検証:
+
+```sh
+uv sync --locked --dev
+uv run --locked tox
+uv build --no-sources --clear
+uv run --locked twine check --strict dist/*
+```
+
+`--clear` により古い配布物の混入を防ぎます。live 検証は必要時に
+`uv run --locked pytest tests/test_live.py --live -q` で実施し、通常 CI には含めません。
 
 ## 初回設定
 

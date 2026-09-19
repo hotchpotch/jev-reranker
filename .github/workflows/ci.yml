@@ -42,17 +42,21 @@ jobs:
       - name: Run tests, lint, and type checks
         run: uv run --locked tox
       - name: Build wheel and source distribution
-        run: uv build --no-sources
+        run: uv build --no-sources --clear
       - name: Check package metadata
         run: uv run --locked twine check --strict dist/*
       - name: Smoke test installed wheel
         run: |
           uv venv /tmp/jev-reranker-wheel-test --python 3.11
-          uv pip install --python /tmp/jev-reranker-wheel-test/bin/python --no-deps dist/*.whl
+          uv pip install --python /tmp/jev-reranker-wheel-test/bin/python --exclude-newer "1 week" dist/*.whl
           cd /tmp
           /tmp/jev-reranker-wheel-test/bin/python - <<'PY'
           from importlib.metadata import version
           import jev_reranker
+          from jev_reranker import JevReranker
+
+          with JevReranker(api_key="offline-wheel-check", dotenv_path=None) as reranker:
+              assert reranker.rank("query", []) == []
 
           print(f"Installed jev-reranker {version('jev-reranker')}: {jev_reranker.__file__}")
           PY

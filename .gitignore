@@ -216,3 +216,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Private live API traces (contain query/document text)
+.live-results/
+.env.*
+!.env.sample

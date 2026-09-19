@@ -1,12 +1,22 @@
 [project]
 name = "jev-reranker"
 version = "0.0.1"
-description = "JEV reranker Python package"
+description = "Multilingual Jev reranking with listwise, pointwise, and pairwise scoring"
 readme = "README.md"
 license = "MIT"
-license-files = ["LICENSE"]
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "httpx>=0.28,<1",
+    "huggingface-hub>=0.30,<2",
+    "python-dotenv>=1,<2",
+    "tokenizers>=0.21,<1",
+]
+
+[project.urls]
+Homepage = "https://github.com/hotchpotch/jev-reranker"
+Repository = "https://github.com/hotchpotch/jev-reranker"
+Issues = "https://github.com/hotchpotch/jev-reranker/issues"
 
 [build-system]
 requires = ["uv_build>=0.12.0,<0.13.0"]
@@ -42,6 +52,12 @@ deps = ruff
 commands = ruff check .
 
 [testenv:type]
-deps = ty
+deps =
+    ty
+    pytest
 commands = ty check
 """
+
+[tool.uv.build-backend]
+source-include = ["docs/**", "tests/**", "scripts/*.py", ".env.sample", ".gitignore"]
+source-exclude = [".env", ".live-results/**", "tests/__pycache__/**"]
