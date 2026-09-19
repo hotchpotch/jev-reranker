@@ -1,4 +1,4 @@
-# jev-reranker: Reranking and Relevance Filtering for RAG
+# jev-reranker: Relevance Filtering & Reranking for RAG
 
 [![CI](https://github.com/hotchpotch/jev-reranker/actions/workflows/ci.yml/badge.svg)](https://github.com/hotchpotch/jev-reranker/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/jev-reranker.svg)](https://pypi.org/project/jev-reranker/)
@@ -7,6 +7,9 @@
 jev-reranker is a Python library for reranking search results and filtering
 retrieved documents with TypeSafe.AI's Jev. It provides prompts for both tasks
 and handles concurrent requests, splitting long candidate lists, and retries.
+
+For a walkthrough with examples, read
+[Introducing jev-reranker: Reranking and Relevance Filtering for RAG](https://huggingface.co/blog/hotchpotch/introducing-jev-reranker).
 
 Search results can match a question without helping answer it. Passing every
 match to an LLM adds input tokens and potentially distracting context.
