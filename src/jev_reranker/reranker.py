@@ -1,7 +1,8 @@
-"""Synchronous multilingual reranking through TypeSafe Jev."""
+"""Async-first multilingual reranking through TypeSafe Jev."""
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import hashlib
 import math
@@ -9,14 +10,14 @@ import os
 import platform
 import string
 import time
-from collections.abc import Sequence
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from importlib.metadata import version
-from itertools import combinations
+from enum import Enum
+from importlib.metadata import PackageNotFoundError, version
+from itertools import combinations, islice
 from pathlib import Path
-from threading import BoundedSemaphore, Lock
+from threading import Lock
 from typing import Any, Self
 from urllib.parse import urlsplit
 
@@ -25,6 +26,7 @@ from dotenv import dotenv_values
 
 from . import _client
 from ._ranking import SHUFFLE_SEED, score_listwise
+from ._runtime import Runtime, require_sync_context
 from .errors import ConfigurationError, ContextLimitError, JevError
 from .tokenization import (
     DEFAULT_TOKENIZER,
@@ -79,7 +81,28 @@ class _Run:
     models: set[str] = field(default_factory=set)
     splits: list[dict[str, Any]] = field(default_factory=list)
     documents: list[dict[str, Any]] = field(default_factory=list)
-    lock: Any = field(default_factory=Lock)
+
+
+class _Unset(Enum):
+    VALUE = "unset"
+
+
+def _legacy_limit(name: str, value: Any, legacy: Any, default: Any) -> Any:
+    if legacy is _Unset.VALUE:
+        return value
+    if value != default and value != legacy:
+        raise ConfigurationError(f"Conflicting {name} and legacy token limit.")
+    return legacy
+
+
+def _dependency_versions() -> dict[str, str | None]:
+    versions: dict[str, str | None] = {}
+    for name in ("httpx", "python-dotenv", "tokenizers", "huggingface-hub"):
+        try:
+            versions[name] = version(name)
+        except PackageNotFoundError:
+            versions[name] = None
+    return versions
 
 
 class JevReranker:
@@ -102,17 +125,66 @@ class JevReranker:
         max_concurrency: int | None = None,
         timeout: float = 180.0,
         max_retries: int = 8,
-        document_max_tokens: int | None = 4000,
-        split_state_token_budget: int = 26000,
-        split_request_token_budget: int = 48000,
-        split_tokenizer_name: str = DEFAULT_TOKENIZER,
+        document_max_length: int | None = 4000,
+        split_state_budget: int = 26000,
+        split_request_budget: int = 48000,
+        split_tokenizer_name: str | None = None,
         split_tokenizer_revision: str | None = None,
         tokenizer_max_length: int = 65536,
-        tokenizer: Tokenizer | None = None,
+        tokenizer: Tokenizer | str | None = None,
+        length_fn: Callable[[str], int] | None = None,
+        document_max_tokens: int | None | _Unset = _Unset.VALUE,
+        split_state_token_budget: int | _Unset = _Unset.VALUE,
+        split_request_token_budget: int | _Unset = _Unset.VALUE,
         instructions: str | None = None,
         criteria: dict[str, str] | None = None,
-        client: httpx.Client | None = None,
+        client: httpx.AsyncClient | None = None,
+        transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
+        document_max_length = _legacy_limit(
+            "document_max_length", document_max_length, document_max_tokens, 4000
+        )
+        split_state_budget = _legacy_limit(
+            "split_state_budget", split_state_budget, split_state_token_budget, 26000
+        )
+        split_request_budget = _legacy_limit(
+            "split_request_budget",
+            split_request_budget,
+            split_request_token_budget,
+            48000,
+        )
+        if isinstance(tokenizer, str):
+            if split_tokenizer_name is not None:
+                raise ConfigurationError(
+                    "Pass tokenizer or split_tokenizer_name, not both."
+                )
+            split_tokenizer_name, tokenizer = tokenizer, None
+        elif tokenizer is not None and split_tokenizer_name is not None:
+            raise ConfigurationError(
+                "Pass a tokenizer object or a tokenizer name, not both."
+            )
+        if length_fn is not None and not callable(length_fn):
+            raise ConfigurationError("length_fn must be callable: (str) -> int.")
+        if length_fn is not None and (
+            tokenizer is not None or split_tokenizer_name is not None
+        ):
+            raise ConfigurationError("Pass length_fn or tokenizer, not both.")
+        if split_tokenizer_revision is not None and split_tokenizer_name is None:
+            raise ConfigurationError(
+                "split_tokenizer_revision requires a tokenizer name."
+            )
+        if client is not None and not isinstance(client, httpx.AsyncClient):
+            raise ConfigurationError(
+                "client must be an httpx.AsyncClient; use transport= for custom transports."
+            )
+        if client is not None and transport is not None:
+            raise ConfigurationError("Pass either client or transport, not both.")
+        if transport is not None and not isinstance(
+            transport, httpx.AsyncBaseTransport
+        ):
+            raise ConfigurationError(
+                "transport must support asynchronous HTTP requests."
+            )
         if mode not in ("listwise", "pointwise", "pairwise"):
             raise ConfigurationError("mode must be listwise, pointwise, or pairwise.")
         max_concurrency = (
@@ -122,14 +194,14 @@ class JevReranker:
         )
         for name, value in (
             ("max_concurrency", max_concurrency),
-            ("split_state_token_budget", split_state_token_budget),
-            ("split_request_token_budget", split_request_token_budget),
+            ("split_state_budget", split_state_budget),
+            ("split_request_budget", split_request_budget),
             ("tokenizer_max_length", tokenizer_max_length),
         ):
             positive_int(name, value)
         positive_int("max_retries", max_retries, minimum=0)
-        if document_max_tokens is not None:
-            positive_int("document_max_tokens", document_max_tokens)
+        if document_max_length is not None:
+            positive_int("document_max_length", document_max_length)
         if (
             isinstance(timeout, bool)
             or not isinstance(timeout, (int, float))
@@ -138,7 +210,8 @@ class JevReranker:
         ):
             raise ConfigurationError("timeout must be positive and finite.")
         nonempty("api_key_env", api_key_env)
-        nonempty("split_tokenizer_name", split_tokenizer_name)
+        if split_tokenizer_name is not None:
+            nonempty("split_tokenizer_name", split_tokenizer_name)
         if split_tokenizer_revision is not None:
             nonempty("split_tokenizer_revision", split_tokenizer_revision)
         if tokenizer is not None and not all(
@@ -223,10 +296,10 @@ class JevReranker:
             timeout,
             max_retries,
         )
-        self.document_max_tokens = document_max_tokens
-        self.split_state_token_budget, self.split_request_token_budget = (
-            split_state_token_budget,
-            split_request_token_budget,
+        self.document_max_length = document_max_length
+        self.split_state_budget, self.split_request_budget = (
+            split_state_budget,
+            split_request_budget,
         )
         if (
             split_tokenizer_revision is None
@@ -243,35 +316,41 @@ class JevReranker:
         self._api_key = api_key
         self._tokenizer = tokenizer
         self._custom_tokenizer = tokenizer is not None
-        self._tokenizer_lock = Lock()
-        self._semaphore = BoundedSemaphore(max_concurrency)
-        self._client = (
-            client
-            if client is not None
-            else httpx.Client(
-                limits=httpx.Limits(
-                    max_connections=max_concurrency,
-                    max_keepalive_connections=max_concurrency,
-                )
-            )
+        uses_tokenizer = tokenizer is not None or split_tokenizer_name is not None
+        self._length_fn = (
+            None if uses_tokenizer else (len if length_fn is None else length_fn)
         )
-        self._owns_client = client is None
-        self._closed = False
+        self.length_unit = (
+            "tokens"
+            if uses_tokenizer
+            else ("characters" if self._length_fn is len else "custom")
+        )
+        self._tokenizer_lock = Lock()
+        self._runtime = Runtime(max_concurrency, client, transport)
 
     def close(self) -> None:
-        """Close owned HTTP resources. Borrowed clients remain open."""
-        if not self._closed:
-            self._closed = True
-            if self._owns_client:
-                self._client.close()
+        """Wait for sync calls and close owned resources and the sync loop thread."""
+        self._runtime.close()
+
+    async def aclose(self) -> None:
+        """Wait for async calls and close owned resources on their event loop."""
+        await self._runtime.aclose()
 
     def __enter__(self) -> Self:
-        if self._closed:
-            raise ConfigurationError("JevReranker is closed.")
+        require_sync_context()
+        if self._runtime.closed or self._runtime.closing:
+            raise ConfigurationError("JevReranker is closed or closing.")
         return self
 
     def __exit__(self, *exc: object) -> None:
         self.close()
+
+    async def __aenter__(self) -> Self:
+        self._runtime.bind()
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        await self.aclose()
 
     def rerank(
         self,
@@ -302,13 +381,80 @@ class JevReranker:
         return_documents: bool = True,
         detail: bool = False,
     ) -> dict[str, Any]:
+        """Blocking wrapper over a_raw_rank, reusing a dedicated event loop."""
+        return self._runtime.run(
+            lambda: self.a_raw_rank(
+                query,
+                documents,
+                top_k=top_k,
+                return_documents=return_documents,
+                detail=detail,
+            )
+        )
+
+    raw_rank = raw_rerank
+
+    async def a_rank(
+        self,
+        query: str,
+        documents: Sequence[str],
+        *,
+        top_k: int | None = None,
+        return_documents: bool = True,
+        detail: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Await sorted results from a_raw_rank."""
+        return (
+            await self.a_raw_rank(
+                query,
+                documents,
+                top_k=top_k,
+                return_documents=return_documents,
+                detail=detail,
+            )
+        )["results"]
+
+    a_rerank = a_rank
+
+    async def a_raw_rank(
+        self,
+        query: str,
+        documents: Sequence[str],
+        *,
+        top_k: int | None = None,
+        return_documents: bool = True,
+        detail: bool = False,
+    ) -> dict[str, Any]:
+        """Return results and optional execution detail on the owning event loop.
+
+        Cancellation propagates after this call's pending HTTP tasks are cleaned
+        up. Query/document text is present in detail; credentials are not.
+        """
+        async with self._runtime.operation():
+            return await self._a_raw_rank(
+                query,
+                documents,
+                top_k=top_k,
+                return_documents=return_documents,
+                detail=detail,
+            )
+
+    a_raw_rerank = a_raw_rank
+
+    async def _a_raw_rank(
+        self,
+        query: str,
+        documents: Sequence[str],
+        *,
+        top_k: int | None = None,
+        return_documents: bool = True,
+        detail: bool = False,
+    ) -> dict[str, Any]:
         """Return ``results`` and, optionally, a JSON-serializable execution ``detail``.
 
         detail includes the text sent to the API. It contains no authentication
         headers or API key. No files are written automatically.
         """
-        if self._closed:
-            raise ConfigurationError("JevReranker is closed.")
         nonempty("query", query)
         if isinstance(documents, (str, bytes)) or not isinstance(documents, Sequence):
             raise TypeError("documents must be a sequence of strings.")
@@ -325,11 +471,14 @@ class JevReranker:
             if not docs or top_k == 0:
                 scores: list[float] = []
             else:
-                prepared = self._prepare(docs, run)
-                scores = self._score(query, prepared, run)
+                prepared = await asyncio.to_thread(self._prepare, docs, run)
+                scores = await self._score(query, prepared, run)
             results = []
             for index in sorted(range(len(scores)), key=lambda i: -scores[i])[:top_k]:
-                result: dict[str, Any] = {"corpus_id": index, "score": scores[index]}
+                result: dict[str, Any] = {
+                    "document_index": index,
+                    "score": scores[index],
+                }
                 if return_documents:
                     result["text"] = docs[index]
                 if detail:
@@ -351,55 +500,102 @@ class JevReranker:
     def _get_tokenizer(self) -> Tokenizer:
         # Caller owns _tokenizer_lock; tokenizers can have mutable configuration.
         if self._tokenizer is None:
+            if self.split_tokenizer_name is None:
+                raise ConfigurationError("No tokenizer selected.")
             try:
                 self._tokenizer = HuggingFaceTokenizer(
                     self.split_tokenizer_name,
                     revision=self.split_tokenizer_revision,
                     model_max_length=self.tokenizer_max_length,
                 )
+            except ConfigurationError:
+                raise
             except Exception:  # noqa: BLE001 - tokenizers raises a generic Exception for invalid files
                 raise ConfigurationError(
                     "Could not load tokenizer. Check the tokenizer name/revision, HF access and cache, "
                     "accept the Gemma license if required, or supply a local/custom tokenizer."
                 ) from None
+        current_limit = getattr(self._tokenizer, "model_max_length", None)
+        if isinstance(current_limit, int) and current_limit < self.tokenizer_max_length:
+            try:
+                # Optional attribute, deliberately outside the Tokenizer protocol.
+                setattr(self._tokenizer, "model_max_length", self.tokenizer_max_length)  # noqa: B010
+            except (AttributeError, TypeError, ValueError):
+                raise ConfigurationError(
+                    "Tokenizer model_max_length cannot be increased. "
+                    "Supply a tokenizer with a writable limit or an untruncated wrapper."
+                ) from None
         return self._tokenizer
+
+    def _count_locked(self, text: str) -> int:
+        if self._length_fn is None:
+            return len(self._get_tokenizer().encode(text))
+        try:
+            value = self._length_fn(text)
+        except Exception:  # noqa: BLE001 - user callback failures need a stable public exception
+            raise ConfigurationError("length_fn failed while counting text.") from None
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ConfigurationError("length_fn must return a nonnegative integer.")
+        return value
 
     def _count(self, text: str) -> int:
         with self._tokenizer_lock:
-            return len(self._get_tokenizer().encode(text))
+            return self._count_locked(text)
+
+    def _truncate(self, text: str, limit: int) -> str:
+        # Caller holds the counter/tokenizer lock.
+        if self._length_fn is len:
+            return text[:limit]
+        if self._length_fn is not None:
+            if self._count_locked("") > limit:
+                raise ConfigurationError(
+                    "length_fn cannot fit even an empty prefix within the limit."
+                )
+            low, high = 0, len(text)
+            while high - low > 1:
+                middle = (low + high) // 2
+                if self._count_locked(text[:middle]) <= limit:
+                    low = middle
+                else:
+                    high = middle
+            # Safe prefix; not necessarily the longest for nonmonotonic counters.
+            return text[:low]
+        tokenizer = self._get_tokenizer()
+        tokens = tokenizer.encode(text)[:limit]
+        while True:
+            decoded = tokenizer.decode(tokens)
+            length = self._count_locked(decoded)
+            if length <= limit:
+                return decoded
+            if not tokens:
+                raise ConfigurationError(
+                    "Tokenizer cannot produce text within document_max_length."
+                )
+            tokens = tokens[: max(0, len(tokens) - max(1, length - limit))]
 
     def _prepare(self, docs: list[str], run: _Run) -> list[str]:
         prepared = []
         with self._tokenizer_lock:
-            tokenizer = self._get_tokenizer()
             for index, original in enumerate(docs):
-                tokens = tokenizer.encode(original)
-                original_count = len(tokens)
+                original_count = self._count_locked(original)
                 text = original
-                limit = self.document_max_tokens
+                limit = self.document_max_length
                 if limit is not None and original_count > limit:
-                    tokens = tokens[:limit]
-                    while True:
-                        text = tokenizer.decode(tokens)
-                        sent_count = len(tokenizer.encode(text))
-                        if sent_count <= limit:
-                            break
-                        if not tokens:
-                            raise ConfigurationError(
-                                "Tokenizer cannot produce text within document_max_tokens."
-                            )
-                        tokens = tokens[
-                            : max(0, len(tokens) - max(1, sent_count - limit))
-                        ]
-                sent_count = len(tokenizer.encode(text))
+                    text = self._truncate(original, limit)
+                sent_count = self._count_locked(text)
+                if limit is not None and sent_count > limit:
+                    raise ConfigurationError(
+                        "length_fn must be deterministic; truncated text exceeds the limit."
+                    )
                 prepared.append(text)
                 if run.detailed:
                     run.documents.append(
                         {
                             "document_index": index,
                             "sha256": sha(original),
-                            "original_tokens": original_count,
-                            "sent_tokens": sent_count,
+                            "original_length": original_count,
+                            "sent_length": sent_count,
+                            "length_unit": self.length_unit,
                             "truncated": text != original,
                             "request_ids": [],
                             "comparisons": [],
@@ -451,25 +647,31 @@ class JevReranker:
             "request": self._count(_client.json_text(payload)),
         }
 
-    def _request(
-        self, payload: dict[str, Any], indices: list[int], run: _Run
+    async def _estimate_async(self, payload: dict[str, Any]) -> dict[str, int]:
+        return await asyncio.to_thread(self._estimate, payload)
+
+    async def _request(
+        self,
+        payload: dict[str, Any],
+        indices: list[int],
+        run: _Run,
     ) -> list[float]:
         trace: dict[str, Any] = {}
         if run.detailed:
-            with run.lock:
-                trace.update(
-                    id=len(run.requests),
-                    document_indices=indices,
-                    payload=copy.deepcopy(payload),
-                    estimated_tokens=self._estimate(payload),
-                )
-                run.requests.append(trace)
-                for i in indices:
-                    run.documents[i]["request_ids"].append(trace["id"])
+            estimated = await self._estimate_async(payload)
+            trace.update(
+                id=len(run.requests),
+                document_indices=indices,
+                payload=copy.deepcopy(payload),
+                estimated_length=estimated,
+            )
+            run.requests.append(trace)
+            for i in indices:
+                run.documents[i]["request_ids"].append(trace["id"])
         try:
-            with self._semaphore:
-                scores, data = _client.request(
-                    client=self._client,
+            async with self._runtime.semaphore:
+                scores, data = await _client.request(
+                    client=self._runtime.get_client(),
                     endpoint=self.endpoint,
                     api_key=self._api_key,
                     timeout=self.timeout,
@@ -477,88 +679,92 @@ class JevReranker:
                     payload=payload,
                     trace=trace,
                 )
-            with run.lock:
-                run.usage["requests"] += 1
-                run.usage["input_tokens"] += data["usage"]["input_tokens"]
-                run.usage["output_tokens"] += data["usage"]["output_tokens"]
-                run.models.add(data["model"])
-                if run.detailed:
-                    trace["response"] = data
+            run.usage["requests"] += 1
+            run.usage["input_tokens"] += data["usage"]["input_tokens"]
+            run.usage["output_tokens"] += data["usage"]["output_tokens"]
+            run.models.add(data["model"])
+            if run.detailed:
+                trace["response"] = data
             return scores
+        except asyncio.CancelledError:
+            trace["status"] = "cancelled"
+            raise
         finally:
-            with run.lock:
-                run.usage["attempts"] += trace.get("attempts", 0)
-                run.usage["retries"] += trace.get("retries", 0)
-                run.usage["max_tokens_errors"] += (
-                    trace.get("status") == "max_tokens_exceeded"
-                )
+            run.usage["attempts"] += trace.get("attempts", 0)
+            run.usage["retries"] += trace.get("retries", 0)
+            run.usage["max_tokens_errors"] += (
+                trace.get("status") == "max_tokens_exceeded"
+            )
 
-    def _score(self, query: str, docs: list[str], run: _Run) -> list[float]:
+    async def _score(self, query: str, docs: list[str], run: _Run) -> list[float]:
         def payload(indices: list[int]) -> dict[str, Any]:
             return self._payload(query, docs, indices)
 
-        def score_one(indices: list[int]) -> list[float]:
+        async def score_one(indices: list[int]) -> list[float]:
             body = payload(indices)
-            estimate = self._estimate(body)
+            estimate = await self._estimate_async(body)
             if (
-                estimate["state_plus_longest_question"] > self.split_state_token_budget
-                or estimate["request"] > self.split_request_token_budget
+                estimate["state_plus_longest_question"] > self.split_state_budget
+                or estimate["request"] > self.split_request_budget
             ):
                 raise ContextLimitError(
                     f"Query and document group {indices} exceed the estimated context budget."
                 )
-            return self._request(body, indices, run)
+            return await self._request(body, indices, run)
 
         if self.mode == "listwise":
-            return score_listwise(
+            lengths = await asyncio.to_thread(lambda: [self._count(d) for d in docs])
+            return await score_listwise(
                 query=query,
-                lengths=[self._count(d) for d in docs],
-                state_budget=self.split_state_token_budget,
-                request_budget=self.split_request_token_budget,
-                estimate=lambda ids: self._estimate(payload(ids)),
+                lengths=lengths,
+                state_budget=self.split_state_budget,
+                request_budget=self.split_request_budget,
+                estimate=lambda ids: self._estimate_async(payload(ids)),
                 request=lambda ids: self._request(payload(ids), ids, run),
                 splits=run.splits,
             )
+        scores = [0.0] * len(docs)
         if self.mode == "pointwise":
-            with ThreadPoolExecutor(max_workers=self.max_concurrency) as pool:
-                return [
-                    values[0]
-                    for values in pool.map(score_one, ([i] for i in range(len(docs))))
-                ]
+            indices = iter(range(len(docs)))
+
+            async def worker() -> None:
+                # Iterator advances synchronously on this loop, before awaiting.
+                for index in indices:
+                    scores[index] = (await score_one([index]))[0]
+
+            await _gather_cancel_on_error(
+                *(worker() for _ in range(min(len(docs), self.max_concurrency)))
+            )
+            return scores
         if len(docs) == 1:
             return [0.5]
-        scores = [0.0] * len(docs)
-
-        def compare(pair: tuple[int, int]) -> tuple[tuple[int, int], list[float]]:
-            return pair, score_one(list(pair))
-
-        # Bound queued futures too: O(n²) comparisons must not create O(n²) futures.
         pairs = iter(combinations(range(len(docs)), 2))
-        with ThreadPoolExecutor(max_workers=self.max_concurrency) as pool:
-            from itertools import islice
-
-            while batch := list(islice(pairs, self.max_concurrency)):
-                for (left, right), (forward, reverse) in pool.map(compare, batch):
-                    win = (forward + 1 - reverse) / 2
-                    scores[left] += win
-                    scores[right] += 1 - win
-                    if run.detailed:
-                        run.documents[left]["comparisons"].append(
-                            {
-                                "opponent": right,
-                                "win_probability": win,
-                                "forward_noul": forward,
-                                "reverse_noul": reverse,
-                            }
-                        )
-                        run.documents[right]["comparisons"].append(
-                            {
-                                "opponent": left,
-                                "win_probability": 1 - win,
-                                "forward_noul": reverse,
-                                "reverse_noul": forward,
-                            }
-                        )
+        # Keep queued tasks and temporary results bounded for O(n²) comparisons.
+        while batch := list(islice(pairs, self.max_concurrency)):
+            values = await _gather_cancel_on_error(
+                *(score_one(list(pair)) for pair in batch)
+            )
+            for (left, right), (forward, reverse) in zip(batch, values, strict=True):
+                win = (forward + 1 - reverse) / 2
+                scores[left] += win
+                scores[right] += 1 - win
+                if run.detailed:
+                    run.documents[left]["comparisons"].append(
+                        {
+                            "opponent": right,
+                            "win_probability": win,
+                            "forward_noul": forward,
+                            "reverse_noul": reverse,
+                        }
+                    )
+                    run.documents[right]["comparisons"].append(
+                        {
+                            "opponent": left,
+                            "win_probability": 1 - win,
+                            "forward_noul": reverse,
+                            "reverse_noul": forward,
+                        }
+                    )
         return [score / (len(docs) - 1) for score in scores]
 
     def _detail(
@@ -572,7 +778,7 @@ class JevReranker:
     ) -> dict[str, Any]:
         tokenizer = self._tokenizer
         data = {
-            "schema_version": 1,
+            "schema_version": 2,
             "status": status,
             "started_at": start,
             "elapsed_seconds": time.monotonic() - started,
@@ -580,17 +786,17 @@ class JevReranker:
                 "python": platform.python_version(),
                 "platform": platform.system(),
                 "package_version": version("jev-reranker"),
-                "dependencies": {
-                    name: version(name)
-                    for name in (
-                        "httpx",
-                        "tokenizers",
-                        "huggingface-hub",
-                        "python-dotenv",
-                    )
-                },
+                "dependencies": _dependency_versions(),
             },
             "configuration": {
+                "length_unit": self.length_unit,
+                "length_function": (
+                    f"{getattr(self._length_fn, '__module__', type(self._length_fn).__module__)}."
+                    f"{getattr(self._length_fn, '__qualname__', type(self._length_fn).__qualname__)}"
+                    if self._length_fn is not None
+                    else "tokenizer.encode"
+                ),
+                "execution_backend": "httpx.AsyncClient/asyncio",
                 "model": self.model,
                 "mode": self.mode,
                 "endpoint": self.endpoint,
@@ -599,9 +805,9 @@ class JevReranker:
                 "max_concurrency": self.max_concurrency,
                 "timeout": self.timeout,
                 "max_retries": self.max_retries,
-                "document_max_tokens": self.document_max_tokens,
-                "split_state_token_budget": self.split_state_token_budget,
-                "split_request_token_budget": self.split_request_token_budget,
+                "document_max_length": self.document_max_length,
+                "split_state_budget": self.split_state_budget,
+                "split_request_budget": self.split_request_budget,
                 "tokenizer": (
                     f"{type(tokenizer).__module__}.{type(tokenizer).__qualname__}"
                     if self._custom_tokenizer
@@ -613,7 +819,9 @@ class JevReranker:
                 ),
                 "tokenizer_max_length": getattr(
                     tokenizer, "model_max_length", self.tokenizer_max_length
-                ),
+                )
+                if self.length_unit == "tokens"
+                else None,
                 "estimates_are_provider_tokens": False,
                 "shuffle_seed": SHUFFLE_SEED,
                 "tie_break": "stable_input_order",
@@ -641,3 +849,15 @@ class JevReranker:
         if isinstance(value, dict):
             return {self._redact(k): self._redact(v) for k, v in value.items()}
         return value
+
+
+async def _gather_cancel_on_error(*coroutines: Any) -> list[Any]:
+    """Drain siblings on failure/cancellation, preserving public exception types."""
+    tasks = [asyncio.create_task(coro) for coro in coroutines]
+    try:
+        return list(await asyncio.gather(*tasks))
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise

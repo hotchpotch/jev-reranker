@@ -51,13 +51,46 @@ jobs:
           uv pip install --python /tmp/jev-reranker-wheel-test/bin/python --exclude-newer "1 week" dist/*.whl
           cd /tmp
           /tmp/jev-reranker-wheel-test/bin/python - <<'PY'
+          import asyncio
+          import json
           from importlib.metadata import version
+          from importlib.util import find_spec
+          import httpx
           import jev_reranker
-          from jev_reranker import JevReranker
+          from jev_reranker import ConfigurationError, HuggingFaceTokenizer, JevReranker
 
-          with JevReranker(api_key="offline-wheel-check", dotenv_path=None) as reranker:
-              assert reranker.rank("query", []) == []
+          assert find_spec("tokenizers") is None
+          assert find_spec("huggingface_hub") is None
 
+          def respond(request):
+              payload = json.loads(request.content)
+              return httpx.Response(200, json={
+                  "model": "offline",
+                  "answers": {key: {"type": "noul", "noul": 0.5} for key in payload["questions"]},
+                  "usage": {"input_tokens": 1, "output_tokens": 1},
+              })
+
+          def ranker():
+              return JevReranker(api_key="offline-wheel-check", dotenv_path=None,
+                                 transport=httpx.MockTransport(respond))
+
+          with ranker() as reranker:
+              assert reranker.rank("query", ["document"])[0]["document_index"] == 0
+
+          async def check_async():
+              async with ranker() as reranker:
+                  assert (await reranker.a_rank("query", ["document"]))[0]["document_index"] == 0
+                  raw = await reranker.a_raw_rank("query", ["document"], detail=True)
+                  assert raw["results"][0]["detail"]["original_length"] == 8
+                  assert raw["detail"]["configuration"]["tokenizer"] is None
+
+          asyncio.run(check_async())
+          try:
+              HuggingFaceTokenizer()
+          except ConfigurationError as exc:
+              assert "jev-reranker[tokenizer]" in str(exc)
+          else:
+              raise AssertionError("Tokenizer dependencies unexpectedly available")
           print(f"Installed jev-reranker {version('jev-reranker')}: {jev_reranker.__file__}")
           PY
       - name: Upload distributions

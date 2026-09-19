@@ -8,10 +8,11 @@ license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
 requires-python = ">=3.11"
 dependencies = [
     "httpx>=0.28,<1",
-    "huggingface-hub>=0.30,<2",
     "python-dotenv>=1,<2",
-    "tokenizers>=0.21,<1",
 ]
+
+[project.optional-dependencies]
+tokenizer = ["huggingface-hub>=0.30,<2", "tokenizers>=0.21,<1"]
 
 [project.urls]
 Homepage = "https://github.com/hotchpotch/jev-reranker"
@@ -24,6 +25,8 @@ build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
+    "huggingface-hub>=0.30,<2",
+    "tokenizers>=0.21,<1",
     "pytest>=9.1.1",
     "ruff>=0.16.7",
     "tox>=4.61.4",
@@ -44,6 +47,7 @@ parallel_show_output = true
 env_list = py311, lint, type
 
 [testenv]
+extras = tokenizer
 deps = pytest
 commands = pytest {posargs}
 

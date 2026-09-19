@@ -512,15 +512,21 @@ version = "0.0.1"
 source = { editable = "." }
 dependencies = [
     { name = "httpx" },
-    { name = "huggingface-hub" },
     { name = "python-dotenv" },
+]
+
+[package.optional-dependencies]
+tokenizer = [
+    { name = "huggingface-hub" },
     { name = "tokenizers" },
 ]
 
 [package.dev-dependencies]
 dev = [
+    { name = "huggingface-hub" },
     { name = "pytest" },
     { name = "ruff" },
+    { name = "tokenizers" },
     { name = "tox" },
     { name = "tox-uv" },
     { name = "twine" },
@@ -530,15 +536,18 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "httpx", specifier = ">=0.28,<1" },
-    { name = "huggingface-hub", specifier = ">=0.30,<2" },
+    { name = "huggingface-hub", marker = "extra == 'tokenizer'", specifier = ">=0.30,<2" },
     { name = "python-dotenv", specifier = ">=1,<2" },
-    { name = "tokenizers", specifier = ">=0.21,<1" },
+    { name = "tokenizers", marker = "extra == 'tokenizer'", specifier = ">=0.21,<1" },
 ]
+provides-extras = ["tokenizer"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "huggingface-hub", specifier = ">=0.30,<2" },
     { name = "pytest", specifier = ">=9.1.1" },
     { name = "ruff", specifier = ">=0.16.7" },
+    { name = "tokenizers", specifier = ">=0.21,<1" },
     { name = "tox", specifier = ">=4.61.4" },
     { name = "tox-uv", specifier = ">=1.36.0" },
     { name = "twine", specifier = ">=7.0.0" },

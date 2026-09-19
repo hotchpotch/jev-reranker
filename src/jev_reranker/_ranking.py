@@ -2,7 +2,7 @@
 
 import hashlib
 import math
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from .errors import ContextLimitError
@@ -27,14 +27,14 @@ def balanced_chunks(
     return chunks
 
 
-def score_listwise(
+async def score_listwise(
     *,
     query: str,
     lengths: list[int],
     state_budget: int,
     request_budget: int,
-    estimate: Callable[[list[int]], dict[str, int]],
-    request: Callable[[list[int]], list[float]],
+    estimate: Callable[[list[int]], Awaitable[dict[str, int]]],
+    request: Callable[[list[int]], Awaitable[list[float]]],
     splits: list[dict[str, Any]],
 ) -> list[float]:
     scores = [0.0] * len(lengths)
@@ -43,12 +43,14 @@ def score_listwise(
     def fits(value: dict[str, int], sb: int, rb: int) -> bool:
         return value["state_plus_longest_question"] <= sb and value["request"] <= rb
 
-    def split(indices: list[int], depth: int, sb: int, rb: int, reason: str) -> None:
+    async def split(
+        indices: list[int], depth: int, sb: int, rb: int, reason: str
+    ) -> None:
         if len(indices) == 1:
             raise ContextLimitError(
                 f"Query and document index {indices[0]} cannot fit the context budget."
             )
-        value = estimate(indices)
+        value = await estimate(indices)
         count = min(
             len(indices),
             max(
@@ -59,7 +61,8 @@ def score_listwise(
         )
         while True:
             chunks = balanced_chunks(indices, lengths, count)
-            if all(fits(estimate(c), sb, rb) for c in chunks) or count == len(indices):
+            estimates = [await estimate(c) for c in chunks]
+            if all(fits(value, sb, rb) for value in estimates) or count == len(indices):
                 break
             count += 1
         for chunk in chunks:
@@ -73,28 +76,28 @@ def score_listwise(
                 "reason": reason,
                 "depth": depth,
                 "document_indices": indices,
-                "state_token_budget": sb,
-                "request_token_budget": rb,
-                "estimated_tokens": value,
+                "state_budget": sb,
+                "request_budget": rb,
+                "estimated_length": value,
                 "chunks": chunks,
             }
         )
         for chunk in chunks:
-            score(chunk, depth + 1, sb, rb)
+            await score(chunk, depth + 1, sb, rb)
 
-    def score(indices: list[int], depth: int, sb: int, rb: int) -> None:
-        if not fits(estimate(indices), sb, rb):
-            split(indices, depth, sb, rb, "estimated_token_budget")
+    async def score(indices: list[int], depth: int, sb: int, rb: int) -> None:
+        if not fits(await estimate(indices), sb, rb):
+            await split(indices, depth, sb, rb, "estimated_length_budget")
             return
         try:
-            values = request(indices)
+            values = await request(indices)
         except ContextLimitError:
-            split(
+            await split(
                 indices, depth, max(1, sb // 2), max(1, rb // 2), "max_tokens_exceeded"
             )
             return
         for index, value in zip(indices, values, strict=True):
             scores[index] = value
 
-    score(list(range(len(lengths))), 0, state_budget, request_budget)
+    await score(list(range(len(lengths))), 0, state_budget, request_budget)
     return scores

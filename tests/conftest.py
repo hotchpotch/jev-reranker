@@ -38,4 +38,19 @@ def offline_environment(request, monkeypatch):
             "Real HTTP is forbidden in offline tests; use MockTransport or --live tests."
         )
 
+    async def forbid_async_network(*args, **kwargs):
+        forbid_network(*args, **kwargs)
+
     monkeypatch.setattr(httpx.HTTPTransport, "handle_request", forbid_network)
+    monkeypatch.setattr(
+        httpx.AsyncHTTPTransport, "handle_async_request", forbid_async_network
+    )
+
+
+@pytest.fixture(autouse=True)
+def close_sync_test_rankers():
+    from test_reranker import _TEST_RANKERS
+
+    yield
+    while _TEST_RANKERS:
+        _TEST_RANKERS.pop().close()

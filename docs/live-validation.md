@@ -34,3 +34,16 @@
 実サービスの変更、固定モデルの実行揺れ、候補集合によって結果が変わる可能性がある。
 `jev-latest` を使うテストは将来の変更を検出する意図があり、失敗時に期待順位を自動で緩めない。
 分割・長文切り詰め・retry・並行実行・壊れた応答の検証は、別途 offline テストで行う。
+
+## asyncio・optional tokenizer 変更後の再検証
+
+2026-09-19 JST、同じ `.env` で上記コマンドを再実行し、**32 passed（35.24秒）**。
+5言語構成 × 3モード × 同期/非同期の30ケースは Gemma tokenizer を明示指定し、
+全ケースで `document_index=[2, 0, 3, 1]` と厳密なスコア降順を確認した。
+残る2ケースは既定の `len(text)` を使い、同期・非同期それぞれで同じ instance の接続再利用を確認した。
+新しい detail は schema_version=2、長さを original_length/sent_length/length_unit で記録する。
+上の表は変更前の検証記録であり、当時のフィールド名を保持している。
+
+通常検証は121 passed、live 32 skipped。tox の lint/type 検査、clean build、twine strict を通過。
+隔離した base wheel 環境で tokenizer 依存が存在しないこと、非空入力の同期・非同期 mock 採点、
+明示的な tokenizer 利用時の追加依存案内も確認した。

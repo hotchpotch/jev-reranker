@@ -1,5 +1,7 @@
 """Offline contract tests: no credentials, downloads, or network required."""
 
+import asyncio
+import inspect
 import json
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -15,6 +17,12 @@ from jev_reranker import (
     JevReranker,
     ResponseValidationError,
 )
+
+_TEST_RANKERS = []
+
+
+async def no_sleep(_):
+    pass
 
 
 class CharacterTokenizer:
@@ -39,21 +47,22 @@ def response(payload, scores=None):
 def make(handler=None, **kwargs):
     calls = []
 
-    def serve(request):
+    async def serve(request):
         payload = json.loads(request.content)
         calls.append(payload)
         if handler:
-            return handler(payload, len(calls), request)
+            result = handler(payload, len(calls), request)
+            return await result if inspect.isawaitable(result) else result
         return httpx.Response(200, json=response(payload))
 
-    client = httpx.Client(transport=httpx.MockTransport(serve))
     ranker = JevReranker(
         api_key="secret-test-key",
         dotenv_path=None,
         tokenizer=CharacterTokenizer(),
-        client=client,
+        transport=httpx.MockTransport(serve),
         **kwargs,
     )
+    _TEST_RANKERS.append(ranker)
     return ranker, calls
 
 
@@ -68,7 +77,7 @@ def test_scores_sorted_and_duplicate_identity(mode):
 
     ranker, calls = make(handler, mode=mode)
     results = ranker.rank("q", ["bad", "good", "good"])
-    assert [r["corpus_id"] for r in results] == [1, 2, 0]
+    assert [r["document_index"] for r in results] == [1, 2, 0]
     assert [r["score"] for r in results] == [0.9, 0.9, 0.1]
     assert results[0]["text"] == "good"
     assert len(calls) == (1 if mode == "listwise" else 3)
@@ -80,7 +89,7 @@ def test_wrapper_and_top_k(monkeypatch):
     assert ranker.rerank("q", ["a"], top_k=0) == []
     assert not calls
     assert ranker.rank("q", ["a", "b"], top_k=1, return_documents=False) == [
-        {"corpus_id": 0, "score": 0.5}
+        {"document_index": 0, "score": 0.5}
     ]
     assert len(calls[0]["questions"]) == 2
     monkeypatch.setattr(ranker, "raw_rerank", lambda *a, **kw: {"results": ["wrapper"]})
@@ -182,8 +191,8 @@ def test_truncation_and_detail():
     raw = ranker.raw_rerank("質問", ["abcdef", "猫"], detail=True)
     assert calls[0]["state"]["documents"] == {"doc_0": "abc", "doc_1": "猫"}
     assert raw["results"][0]["text"] == "abcdef"
-    assert raw["results"][0]["detail"]["sent_tokens"] == 3
-    assert raw["results"][0]["detail"]["original_tokens"] == 6
+    assert raw["results"][0]["detail"]["sent_length"] == 3
+    assert raw["results"][0]["detail"]["original_length"] == 6
     detail = raw["detail"]
     assert detail["usage"]["input_tokens"] == 100
     assert detail["resolved_models"] == ["jev-test-1"]
@@ -201,7 +210,7 @@ def test_budget_split_every_candidate_once_stable_ties():
     keys = [k for p in calls for k in p["questions"]]
     assert len(calls) > 1
     assert sorted(keys) == sorted(f"doc_{i}" for i in range(11))
-    assert [r["corpus_id"] for r in raw["results"]] == list(range(11))
+    assert [r["document_index"] for r in raw["results"]] == list(range(11))
     assert raw["detail"]["splits"]
     for p in calls:
         state = len(json.dumps(p["state"], ensure_ascii=False, separators=(",", ":")))
@@ -240,7 +249,11 @@ def test_unsplittable_raises_with_detail(mode):
 @pytest.mark.parametrize("status", [429, 500, 502, 503, 504, 529])
 def test_retries_transient_status(monkeypatch, status):
     waits = []
-    monkeypatch.setattr("jev_reranker._client.time.sleep", waits.append)
+
+    async def record_sleep(delay):
+        waits.append(delay)
+
+    monkeypatch.setattr("jev_reranker._client.asyncio.sleep", record_sleep)
 
     def handler(p, count, request):
         if count == 1:
@@ -265,7 +278,7 @@ def test_no_retry_permanent_errors(status):
 
 
 def test_transport_retry_exhaustion(monkeypatch):
-    monkeypatch.setattr("jev_reranker._client.time.sleep", lambda _: None)
+    monkeypatch.setattr("jev_reranker._client.asyncio.sleep", no_sleep)
 
     def handler(p, n, request):
         raise httpx.ReadTimeout("secret-test-key", request=request)
@@ -331,7 +344,7 @@ def test_pairwise_average_symmetric_wins():
 
     ranker, calls = make(handler, mode="pairwise")
     raw = ranker.raw_rerank("q", ["2", "0", "3", "1"], detail=True)
-    assert [r["corpus_id"] for r in raw["results"]] == [2, 0, 3, 1]
+    assert [r["document_index"] for r in raw["results"]] == [2, 0, 3, 1]
     assert [r["score"] for r in raw["results"]] == pytest.approx(
         [0.9, 1.9 / 3, 1.1 / 3, 0.1]
     )
@@ -401,7 +414,7 @@ def test_successful_chunk_not_replayed_when_later_chunk_overflows():
 
 
 def test_transport_success_after_timeout(monkeypatch):
-    monkeypatch.setattr("jev_reranker._client.time.sleep", lambda _: None)
+    monkeypatch.setattr("jev_reranker._client.asyncio.sleep", no_sleep)
 
     def handler(p, n, r):
         if n == 1:
@@ -414,7 +427,7 @@ def test_transport_success_after_timeout(monkeypatch):
 
 
 def test_exhausted_http_retry_and_zero_retry(monkeypatch):
-    monkeypatch.setattr("jev_reranker._client.time.sleep", lambda _: None)
+    monkeypatch.setattr("jev_reranker._client.asyncio.sleep", no_sleep)
     ranker, calls = make(lambda p, n, r: httpx.Response(503), max_retries=0)
     with pytest.raises(APIError) as exc:
         ranker.raw_rerank("q", ["a"], detail=True)
@@ -455,11 +468,12 @@ def test_detail_redacts_echoed_api_key():
     )
 
 
-def test_borrowed_http_client_remains_open():
-    ranker, _ = make()
-    ranker.close()
-    assert not ranker._client.is_closed
-    ranker._client.close()
+def test_sync_client_rejected_explicitly():
+    with (
+        httpx.Client() as client,
+        pytest.raises(ConfigurationError, match="AsyncClient"),
+    ):
+        JevReranker(api_key="test", dotenv_path=None, client=client)  # ty: ignore[invalid-argument-type]
 
 
 def test_retry_after_date_and_caps():
@@ -478,17 +492,16 @@ def test_retry_after_date_and_caps():
 
 def test_global_concurrency_bound_across_calls():
     import threading
-    import time
 
     lock = threading.Lock()
     active = maximum = 0
 
-    def handler(p, n, r):
+    async def handler(p, n, r):
         nonlocal active, maximum
         with lock:
             active += 1
             maximum = max(maximum, active)
-        time.sleep(0.01)
+        await asyncio.sleep(0.01)
         with lock:
             active -= 1
         return httpx.Response(200, json=response(p))

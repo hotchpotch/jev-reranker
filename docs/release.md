@@ -4,7 +4,7 @@
 通常 CI と同じ pytest・ruff・ty、ビルド、メタデータ検査、wheel のインストール検査を通過後、
 PyPI へ公開し、同じ配布物を添付した GitHub Release を作成します。
 公開済み `0.0.1` はパッケージ構成のみの初期リリースです。開発版の reranker 実装を公開する際は新しいバージョンに進めます。
-CI は runtime 依存も含めた隔離 wheel install と、認証・ネットワーク不要の空入力 rank を検査します。
+CI は runtime 依存も含めた隔離 wheel install と、認証・ネットワーク不要の空入力 rank と a_rank/a_raw_rank を検査します。
 
 公開前のローカル検証:
 
@@ -77,3 +77,5 @@ PyPI 公開後に GitHub Release 作成だけが失敗した場合は、失敗�
 ```sh
 uv run --isolated --no-project --exclude-newer-package jev-reranker=false --with jev-reranker==0.0.1 python -c 'import jev_reranker; from importlib.metadata import version; print(version("jev-reranker"))'
 ```
+
+CI の隔離 wheel 検査は tokenizer extra なしで同期・非同期の非空入力を mock HTTP で採点します。tokenizer 依存が入っていないことと、明示利用時の extra インストール案内も確認します。

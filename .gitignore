@@ -221,3 +221,6 @@ __marimo__/
 .live-results/
 .env.*
 !.env.sample
+
+# Local feasibility experiments
+/tmp/

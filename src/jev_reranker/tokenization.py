@@ -3,8 +3,7 @@
 from pathlib import Path
 from typing import Protocol
 
-from huggingface_hub import hf_hub_download
-from tokenizers import Tokenizer as BackendTokenizer
+from .errors import ConfigurationError
 
 DEFAULT_TOKENIZER = "google/embeddinggemma-300m"
 DEFAULT_TOKENIZER_REVISION = "57c266a740f537b4dc058e1b0cda161fd15afa75"
@@ -32,6 +31,13 @@ class HuggingFaceTokenizer:
         revision: str | None = None,
         model_max_length: int = 65536,
     ) -> None:
+        try:
+            from huggingface_hub import hf_hub_download
+            from tokenizers import Tokenizer as BackendTokenizer
+        except ImportError:
+            raise ConfigurationError(
+                "Install jev-reranker[tokenizer] to use HuggingFaceTokenizer."
+            ) from None
         if revision is None and name == DEFAULT_TOKENIZER:
             revision = DEFAULT_TOKENIZER_REVISION
         self.name = name

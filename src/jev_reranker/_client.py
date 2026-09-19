@@ -1,5 +1,6 @@
 """Bounded HTTP retries and strict Noul response validation."""
 
+import asyncio
 import json
 import math
 import random
@@ -67,9 +68,9 @@ def validate(data: Any, keys: list[str]) -> list[float]:
     return scores
 
 
-def request(
+async def request(
     *,
-    client: httpx.Client,
+    client: httpx.AsyncClient,
     endpoint: str,
     api_key: str,
     timeout: float,
@@ -86,7 +87,7 @@ def request(
             trace["retries"] = attempt
             retry_after = None
             try:
-                reply = client.post(
+                reply = await client.post(
                     endpoint,
                     content=json_text(payload).encode(),
                     headers={
@@ -136,7 +137,10 @@ def request(
                 retry_after = reply.headers.get("Retry-After")
             delay = retry_delay(attempt, retry_after)
             trace["waits"].append(delay)
-            time.sleep(delay)
+            await asyncio.sleep(delay)
+    except asyncio.CancelledError:
+        trace["status"] = "cancelled"
+        raise
     finally:
         trace["elapsed_seconds"] = time.monotonic() - started
         if trace["status"] == "running":
