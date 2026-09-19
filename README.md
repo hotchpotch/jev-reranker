@@ -254,3 +254,11 @@ uv run --locked twine check --strict dist/*
 ## ライセンス
 
 MIT。[LICENSE](LICENSE)、移植元の [権利表示](THIRD_PARTY_NOTICES.md) を参照してください。
+
+## HotPotQA の評価例
+
+[examples/hotpotqa.py](examples/hotpotqa.py) は NanoBEIR-en の hybrid 候補から全正解を含む10文書を選び、seed 42でシャッフルして50 query の nDCG@10を計測します。[実行手順・指標の定義・実測結果](examples/README.md) を参照してください。
+
+```sh
+uv run --locked --group examples --extra tokenizer python examples/hotpotqa.py
+```

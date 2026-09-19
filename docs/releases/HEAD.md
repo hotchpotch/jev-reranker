@@ -17,3 +17,7 @@
 - 結果の入力位置を `corpus_id` から `document_index` に改名。detail schema 2 は original_length/sent_length/length_unit を記録し、API の usage token 数と区別。
 
 - tokenizer オブジェクトの `model_max_length` を自動で `tokenizer_max_length`（既定65536）以上に引き上げる。既存のより大きな値は維持し、文書の送信上限とは分離。
+
+- NanoBEIR-en HotPotQA の50 query × 10文書を評価する example を追加。hybrid 順と正解保証による候補選択、seed 42のシャッフル、nDCG@10 と詳細ログに対応。pyarrow は examples dependency group のみに追加。
+
+- HotPotQA example の候補選択を全正解保証に修正。全 qrels 文書を確保し、残りを hybrid 上位で埋める。hybrid 外の正解は corpus から補完。

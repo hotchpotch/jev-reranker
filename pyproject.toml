@@ -34,6 +34,9 @@ dev = [
     "twine>=7.0.0",
     "ty>=0.0.80",
 ]
+examples = [
+    "pyarrow>=20,<24",
+]
 
 [tool.uv]
 exclude-newer = "1 week"
@@ -49,7 +52,7 @@ env_list = py311, lint, type
 [testenv]
 extras = tokenizer
 deps = pytest
-commands = pytest {posargs}
+commands = pytest tests examples/hotpotqa.py {posargs}
 
 [testenv:lint]
 deps = ruff
@@ -63,5 +66,5 @@ commands = ty check
 """
 
 [tool.uv.build-backend]
-source-include = ["docs/**", "tests/**", "scripts/*.py", ".env.sample", ".gitignore"]
+source-include = ["examples/*.py", "examples/*.md", "docs/**", "tests/**", "scripts/*.py", ".env.sample", ".gitignore"]
 source-exclude = [".env", ".live-results/**", "tests/__pycache__/**"]
