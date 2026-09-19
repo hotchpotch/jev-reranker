@@ -27,6 +27,7 @@ uv build
 
 GitHub Actions で検査と配布物のビルドを行います。`vX.Y.Z` タグの push で PyPI に公開します。
 初回設定と公開手順は [リリース手順](docs/release.md) を参照してください。
+変更履歴は [CHANGELOG](CHANGELOG.md)、次回リリースの変更は [HEAD](docs/releases/HEAD.md) に記録します。
 
 ## ライセンス
 

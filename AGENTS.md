@@ -48,3 +48,22 @@ with local validation; it runs on main pushes, pull requests, and manual dispatc
   succeeded, rerun only the failed GitHub Release job, not the upload job.
 - Confirm both PyPI installation and GitHub Release assets after publication.
 - Keep `docs/release.md` synchronized with the actual workflow.
+
+## Changelog and Release Notes
+
+- Record user-visible changes in `docs/releases/HEAD.md` during development.
+  Describe actual behavior and limitations, not implementation work logs.
+- When preparing a release, move the draft into `docs/releases/vX.Y.Z.md`, add
+  its release date, and reset `HEAD.md` to only `# HEAD`. Update `CHANGELOG.md`
+  with the new version first. Commit these together with the version bump.
+- Keep historical release logs accurate; do not include later changes in an
+  already released version's notes.
+- `python scripts/release-notes.py vX.Y.Z` generates the GitHub Release body.
+  Match the reference project's selection rule: use a nonempty `HEAD.md` first,
+  then the versioned file, then `Release vX.Y.Z` as a fallback. Preserve Markdown
+  paragraph spacing. Keep `tests/test_release_notes.py` aligned with this rule.
+- Before tagging, ensure `HEAD.md` is reset and the versioned release log is
+  complete. Preview the generated text to avoid publishing next-release drafts.
+- GitHub Releases must contain the generated notes and the same wheel and sdist
+  uploaded to PyPI. GitHub Packages has no Python package registry; do not add a
+  container publication solely to populate the repository's Packages section.

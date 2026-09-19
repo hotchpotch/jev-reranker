@@ -24,6 +24,23 @@ API トークンや GitHub Secrets の登録は不要です。
 pending publisher の登録だけでは名前は予約されず、初回公開の成功時にプロジェクトが作られます。
 詳しくは [PyPI の公式手順](https://docs.pypi.org/trusted-publishers/creating-a-project-through-oidc/) を参照してください。
 
+## 変更履歴とリリースログ
+
+開発中は `docs/releases/HEAD.md` に利用者向けの変更を追記します。
+リリース準備時に内容を `docs/releases/vX.Y.Z.md` に移し、公開日を記載して、
+`HEAD.md` を `# HEAD` だけに戻します。`CHANGELOG.md` の一覧にも新しいバージョンを先頭追加します。
+バージョン、ロックファイル、リリースログを同じリリース PR に含めます。
+
+```sh
+python scripts/release-notes.py vX.Y.Z
+```
+
+このコマンドは本文のある `HEAD.md` を優先し、空なら指定バージョンのログを使用します。
+両方に本文がなければ `Release vX.Y.Z` を返します。タグを付ける前に、確定ログが存在し、
+`HEAD.md` がリセットされ、生成本文が公開内容と一致していることを確認してください。
+GitHub Release はこの本文と、PyPI に公開したものと同じ wheel・ソース配布物を登録します。
+GitHub Packages は Python パッケージのレジストリに対応していないため、GitHub 側の配布先は Releases です。
+
 ## 公開
 
 1. `pyproject.toml` のバージョンと `uv.lock` を更新します（初回は `0.0.1` 設定済み）。

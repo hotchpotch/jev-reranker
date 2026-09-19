@@ -52,7 +52,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes --title "$GITHUB_REF_NAME"
+          python scripts/release-notes.py "$GITHUB_REF_NAME" > release-notes.md
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release edit "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file release-notes.md
+          else
+            gh release create "$GITHUB_REF_NAME" --verify-tag --notes-file release-notes.md --title "$GITHUB_REF_NAME"
           fi
           gh release upload "$GITHUB_REF_NAME" dist/* --clobber
