@@ -21,3 +21,13 @@
 - NanoBEIR-en HotPotQA の50 query × 10文書を評価する example を追加。hybrid 順と正解保証による候補選択、seed 42のシャッフル、nDCG@10 と詳細ログに対応。pyarrow は examples dependency group のみに追加。
 
 - HotPotQA example の候補選択を全正解保証に修正。全 qrels 文書を確保し、残りを hybrid 上位で埋める。hybrid 外の正解は corpus から補完。
+
+- HotPotQA example に `--target en/ja` と `--top-k` を追加。既定10件、none/all/値なしで元 hybrid 全候補を補完せず評価。dataset・split 別キャッシュと候補内の正解欠落の記録に対応。
+
+- ターゲット切り替えに合わせ、評価スクリプトを `examples/eval.py` に改名。
+
+- `examples/eval.py` に Sentence Transformers CrossEncoder backend を追加。候補選択・nDCG を共通化し、モデル/device/dtype/最大長を指定可能にした。`sentence-transformers` extra と、tokenizer・CrossEncoder・評価用 pyarrow を含む `all` extra を追加。
+
+- `docs/eval.md` に英語の評価ガイドを追加し、`eval.py --help` に両 backend の実行方法・候補選択・指標の説明を掲載。
+
+- 評価スクリプトの候補数は既定で制限なし（元 hybrid 全候補、正解追加なし）。10件評価は `--top-k 10` で明示指定。

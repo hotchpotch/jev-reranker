@@ -19,6 +19,16 @@ cp .env.sample .env
 
 既定では Python の `len(text)` で文字数を数えます。tokenizer の依存パッケージやダウンロードは不要です。
 
+追加依存は用途に応じて選べます。次版公開後は `uv add 'jev-reranker[all]'` で tokenizer・Sentence Transformers（PyTorch を含む）・評価用 pyarrow をまとめて導入できます。現時点の checkout では以下を使います。
+
+```sh
+uv sync --locked --extra all
+# tokenizer のみ: uv sync --locked --extra tokenizer
+# Sentence Transformers のみ: uv sync --locked --extra sentence-transformers
+```
+
+通常インストールには PyTorch は入りません。モデルの重みは extra のインストール時ではなく、使用時に取得します。
+
 ## 使い方
 
 ```python
@@ -257,8 +267,15 @@ MIT。[LICENSE](LICENSE)、移植元の [権利表示](THIRD_PARTY_NOTICES.md) �
 
 ## HotPotQA の評価例
 
-[examples/hotpotqa.py](examples/hotpotqa.py) は NanoBEIR-en の hybrid 候補から全正解を含む10文書を選び、seed 42でシャッフルして50 query の nDCG@10を計測します。[実行手順・指標の定義・実測結果](examples/README.md) を参照してください。
+[examples/eval.py](examples/eval.py) は NanoBEIR-en/ja の hybrid 全候補（既定100/101件）を seed 42でシャッフルして50 query の nDCG@10を計測します。`--top-k 10` を指定すると全正解を含む10文書に絞れます。`--target ja` で日本語、`--top-k none` で元の hybrid 全候補（正解補完なし）を評価できます。[Evaluation guide (English)](docs/eval.md) に実行手順と指標の定義、[実測記録](examples/README.md) に過去の結果をまとめています。
 
 ```sh
-uv run --locked --group examples --extra tokenizer python examples/hotpotqa.py
+uv run --locked --group examples --extra tokenizer python examples/eval.py
+```
+
+Sentence Transformers の CrossEncoder でも同じ入力・指標で評価できます（Jev API キー不要）。
+
+```sh
+uv run --locked --extra all python examples/eval.py --backend sentence-transformers \
+  --model BAAI/bge-reranker-v2-m3 --device cuda:1 --dtype float16 --target en --top-k 10
 ```
