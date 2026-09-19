@@ -1,4 +1,4 @@
-# jev-reranker: Reranking and Relevance Filtering for RAG
+# jev-reranker: Relevance Filtering & Reranking for RAG
 
 [![CI](https://github.com/hotchpotch/jev-reranker/actions/workflows/ci.yml/badge.svg)](https://github.com/hotchpotch/jev-reranker/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/jev-reranker.svg)](https://pypi.org/project/jev-reranker/)
