@@ -4,10 +4,9 @@
 [![PyPI](https://img.shields.io/pypi/v/jev-reranker.svg)](https://pypi.org/project/jev-reranker/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-**A Python reranker and relevance rerank filter powered by TypeSafe.AI's Jev.**
-It includes prompts for ranking and evidence selection, bounded concurrent
-execution, automatic splitting of long candidate lists, and retries—so you can
-use Jev in a retrieval pipeline without building the request handling yourself.
+jev-reranker is a Python library for reranking search results and filtering
+retrieved documents with TypeSafe.AI's Jev. It provides prompts for both tasks
+and handles concurrent requests, splitting long candidate lists, and retries.
 
 Search results can match a question without helping answer it. Passing every
 match to an LLM adds input tokens and potentially distracting context.
@@ -22,19 +21,18 @@ The base package needs no local model or GPU.
 
 ## Highlights
 
-- **Select useful evidence.** Relevance prompts credit direct
-  answers, partial answers, and concrete facts needed for multi-hop reasoning.
-- **Control what reaches generation.** Keep scores at or above your threshold,
-  optionally cap the results, and handle an empty result set explicitly.
-- **Define usefulness for your application.** Customize the instruction and
-  true/false criteria with an ordinary Python dictionary.
-- **Handle large candidate pools.** Automatic listwise splitting and configurable
-  document limits use character counts, an optional tokenizer, or your own counter.
-- **Integrate with sync or async code.** Concurrent requests, transient-error
-  retries, and automatic HTTP cleanup are built in. Choose shared-context
-  listwise scoring or independent pointwise scoring.
-- **Inspect what was kept and dropped.** Optional execution details include all
-  candidate scores, prompts, model information, input lengths, usage, and retries.
+- Relevance filtering scores documents for their contribution to an answer,
+  including partial answers and facts needed for multi-hop reasoning.
+- A configurable threshold determines which documents to keep. Results are sorted
+  by score; an empty list means no candidate passed the threshold.
+- Prompts are Python dictionaries. You can change the instructions and criteria
+  to describe what counts as useful evidence in your application.
+- Long candidate lists are split automatically. Document limits and split budgets
+  can use character counts, a tokenizer, or a custom length function.
+- Sync and async methods share request handling, concurrency limits, retries,
+  and automatic HTTP cleanup.
+- Optional details record all scores, including excluded documents, along with
+  the prompts, model, input lengths, API usage, and request history.
 
 ## Getting started
 
@@ -89,11 +87,10 @@ other metadata from your search results. If nothing passes the threshold,
 `evidence["results"]` is an empty list: your application can try another search or abstain.
 
 Lower thresholds retain more documents; higher thresholds are more selective.
-The default is **0.2**, with equality included. Validate your threshold on your
-own queries: useful evidence can be removed, and irrelevant text can survive.
-Filtering can reduce the context sent to a downstream model, but it happens after
-Jev scores the candidates and does not reduce that scoring work. It does not by
-itself guarantee factual answers.
+The default keeps scores of 0.2 or higher. Test the threshold on your own queries
+to see whether it drops useful passages or keeps unrelated ones. Filtering happens
+after scoring, so it reduces the context sent to the next model, not the work
+done by Jev.
 
 ### Rerank without filtering
 
@@ -111,7 +108,7 @@ for item in results["results"]:
     print(item["document_index"], item["score"], item["text"])
 ```
 
-`rerank()` defaults to **threshold 0.0**, keeping all scored candidates unless you
+`rerank()` defaults to threshold 0.0, keeping all scored candidates unless you
 set `top_k` or raise the threshold. Each call closes its HTTP client automatically,
 including on failure; no context manager or explicit cleanup is needed.
 
@@ -122,13 +119,13 @@ including on failure; no context manager or explicit cleanup is needed.
 | `rerank()` | Order retrieved documents by relevance | 0.0 |
 | `relevance_rerank()` | Select evidence that can help answer the query | 0.2 |
 
-The two methods share the same scoring pipeline. They differ in their default
-instructions and threshold, not in the underlying model. The relevance prompt
-credits concrete partial and linking facts rather than requiring every document
-to contain a complete answer. The [built-in prompts](src/jev_reranker/instructions.py) are ordinary dictionaries
-you can replace with instructions for your application. Scores are not guaranteed
-to be calibrated across queries, models, or scoring modes; evaluate your threshold
-on representative data.
+Both methods use the same Jev model and request handling. Each supplies a
+different prompt and default threshold. The relevance prompt accepts partial
+answers and linking facts: a passage can be useful without answering the whole
+question.
+
+You can read or replace the [built-in prompts](src/jev_reranker/instructions.py).
+A suitable threshold depends on your queries, prompt, model, and scoring mode.
 
 ## API reference
 
@@ -136,7 +133,7 @@ Expand the sections below for signatures, options, and examples. Code snippets
 that only show configuration assume `from jev_reranker import JevReranker`.
 
 <details>
-<summary><strong>Requests, responses, and selection</strong></summary>
+<summary>Requests, responses, and selection</summary>
 
 ```text
 rerank(query, documents, *, instruction=None, threshold=0.0,
@@ -193,7 +190,7 @@ response = reranker.relevance_rerank(
 </details>
 
 <details>
-<summary><strong>Authentication and optional dependencies</strong></summary>
+<summary>Authentication and optional dependencies</summary>
 
 Install from PyPI:
 
@@ -219,7 +216,7 @@ Use `api_key_env=` to read a different environment variable name.
 </details>
 
 <details>
-<summary><strong>Custom instructions</strong></summary>
+<summary>Custom instructions</summary>
 
 `relevance_rerank()` selects its preset by mode: the default `listwise` uses
 `RELEVANCE_INSTRUCTION`; explicit `pointwise` uses `POINTWISE_RELEVANCE_INSTRUCTION`.
@@ -237,10 +234,9 @@ results = reranker.relevance_rerank(
 )
 ```
 
-For execution details, call `relevance_rerank(..., detail=True)`. The method
-selects the pointwise preset automatically on a pointwise instance. The dedicated
-preset adapts independent-evidence instructions to a single-document context;
-it does not imply calibrated scores or guaranteed positive retention. Tune thresholds on your own data.
+The pointwise prompt judges each document using only that document and the query.
+Use `detail=True` to inspect the prompt and scores, and check the threshold when
+switching between listwise and pointwise.
 
 `RERANK_INSTRUCTION`, `PAIRWISE_INSTRUCTION`, `RELEVANCE_INSTRUCTION`, and `POINTWISE_RELEVANCE_INSTRUCTION` in [`instructions.py`](src/jev_reranker/instructions.py) are ordinary dictionaries. You can provide the same structure:
 
@@ -262,7 +258,7 @@ Only the keys `instructions` and `criteria` are accepted. Criteria must contain 
 </details>
 
 <details>
-<summary><strong>Async calls, threads, and client lifecycle</strong></summary>
+<summary>Async calls, threads, and client lifecycle</summary>
 
 HTTP uses `httpx.AsyncClient` and `asyncio` internally:
 
@@ -310,9 +306,9 @@ Cancellation drains child tasks before propagating `asyncio.CancelledError`. HTT
 </details>
 
 <details>
-<summary><strong>Length limits and optional tokenizers</strong></summary>
+<summary>Length limits and optional tokenizers</summary>
 
-`document_max_length` defaults to **4000**. The default `len(text)` counts Unicode code points, not bytes or display width. Documents exceeding the limit are sent as prefixes; returned text remains unchanged.
+`document_max_length` defaults to 4000. The default `len(text)` counts Unicode code points, not bytes or display width. Documents exceeding the limit are sent as prefixes; returned text remains unchanged.
 
 ```python
 reranker = JevReranker(api_key="YOUR-TYPESAFE-API-KEY...", document_max_length=8000)
@@ -320,7 +316,9 @@ results = reranker.rerank("query", ["document"])
 # document_max_length=None disables document truncation.
 ```
 
-**A tokenizer is recommended for production.** English character counts in particular can be much larger than token counts, causing unnecessarily early truncation or request splitting. Install the optional tokenizer dependencies:
+For production use, consider token counting. English text in particular often has
+many more characters than tokens, so character limits can truncate documents or
+split requests earlier than needed. Install the optional tokenizer dependencies:
 
 ```sh
 uv add 'jev-reranker[tokenizer]'
@@ -356,7 +354,7 @@ The function must return a deterministic nonnegative integer and cannot be combi
 </details>
 
 <details>
-<summary><strong>Scoring modes and constructor options</strong></summary>
+<summary>Scoring modes and constructor options</summary>
 
 | Mode | Operation | Score |
 | --- | --- | --- |
@@ -419,7 +417,7 @@ reranker = JevReranker(
 </details>
 
 <details>
-<summary><strong>Execution details, retries, and errors</strong></summary>
+<summary>Execution details, retries, and errors</summary>
 
 ```python
 import json
@@ -497,11 +495,11 @@ by the same author. Its TypeSafe reranker implementation informed this library's
 Jev scoring and listwise partitioning design. Its Nano-set benchmark tooling also
 informed the evaluation example's hybrid candidate handling and nDCG calculation.
 
-The evaluation script uses compatible
-[Nano-set benchmarks](https://huggingface.co/hakari-bench/datasets?search=nano),
-with NanoBEIR-en / NanoHotpotQA as the default and a NanoBEIR-ja preset.
-See the [evaluation guide](docs/eval.md) for other datasets and splits, pinned
-revisions, and candidate selection rules.
+HAKARI-Bench also publishes the
+[Nano-set benchmarks](https://huggingface.co/hakari-bench/datasets?search=nano)
+used by the evaluation script. See the [evaluation guide](docs/eval.md) for
+choosing a dataset and benchmark, the supported data format, and how to run
+comparisons.
 
 ## License
 
