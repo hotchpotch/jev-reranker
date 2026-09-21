@@ -42,6 +42,13 @@ to use the controlled ten-candidate policy described below.
 The relevance task selects `RELEVANCE_INSTRUCTION` for listwise and
 `POINTWISE_RELEVANCE_INSTRUCTION` for pointwise through `a_relevance_rerank()`. It retains the full scoring detail so discarded positives can be audited. It supports listwise and pointwise, not pairwise. The task and threshold options are Jev-only: CrossEncoder scores are raw logits, so the Sentence Transformers backend remains unfiltered and rejects relevance/threshold options.
 
+The built-in listwise relevance prompt automatically stores its full rubric once
+per request and uses shorter per-document references. No additional CLI flag is
+needed. When inspecting request details, read both `payload.state.rubric` and
+`payload.questions`; the questions alone do not contain all evaluation rules.
+Prompt and grouping changes can affect scores, so record the package version and
+effective prompt when comparing runs.
+
 To score each document independently with the dedicated pointwise relevance prompt:
 
 ```sh
@@ -101,6 +108,7 @@ The evaluation script lives in the repository; installing the package alone is n
 | `--dataset` + `--revision` | Another compatible dataset repository and commit | From the preset |
 | `--split` | Benchmark within the dataset | `NanoHotpotQA` |
 | `--task` | Jev scoring prompt: `rerank` or `relevance` | `rerank` |
+| `--query-limit` | Maximum queries, selected in sorted query-ID order | All dataset queries |
 | `--top-k` | Number of **input candidates** per query | No limit |
 
 Unlike the library's `top_k` argument, the script's `--top-k` controls input
@@ -148,12 +156,18 @@ built-in preset's pinned revision. These options work with either backend.
 
 The loader currently requires the following Nano-set layout and constraints:
 
-- Exactly 50 queries with matching hybrid retrieval rows.
+- A nonempty query set with matching hybrid retrieval rows.
 - 100 or 101 hybrid candidates per query.
 - Positive-only qrels: every listed query/document pair is treated as relevant;
   graded relevance and explicit negative qrels are not interpreted.
 - One file at `<config>/<split>-00000-of-00001.parquet` for each of `queries`,
   `corpus`, `qrels`, and `reranking_hybrid`, with the same columns as the presets.
+
+By default, every query in the selected split is evaluated: a 200-query dataset
+runs 200 queries. Add `--query-limit 50` to evaluate only the first 50 query IDs
+in sorted order. The limit must be positive; values above the dataset size use
+all queries. This is a deterministic subset, not a random sample. The manifest
+and summary record the dataset size, requested limit, and evaluated count.
 
 Other Nano-set benchmarks can run when they satisfy this format. The script does
 not automatically discover or run every split, and arbitrary dataset layouts or
@@ -198,9 +212,32 @@ These target and candidate-count options work with both backends. The scoring cu
 | `--model` | Environment/`.env`, then `jev-latest` | Jev model name; use a fixed version for comparisons |
 | `--tokenizer` | `google/embeddinggemma-300m` | Length counter; `none` selects character counting |
 | `--document-max-length` | `4000` | Per-document limit in the counter's units |
+| `--split-state-budget` | `26000` | Estimated state plus longest question budget, in counter units |
+| `--split-request-budget` | `48000` | Estimated whole-request budget, in counter units |
 | `--concurrency` | `4` | Concurrent evaluation queries and instance HTTP limit |
 
 The example opts into Gemma token counting, although the library itself defaults to character counting. Gemma may require Hugging Face authentication and acceptance of its license. Query text is not truncated by the Jev document-length setting. Long listwise requests may be split by the library; splitting and API retries are recorded in detail logs.
+
+Both split budgets must be positive integers. They apply to the Jev backend
+and use tokenizer tokens, or characters with `--tokenizer none`. These are local
+estimates, not the provider's token counts. For relevance scoring with Gemma
+and more conservative listwise grouping, use:
+
+```sh
+uv run --locked --group examples --extra tokenizer python examples/eval.py \
+  --task relevance --tokenizer google/embeddinggemma-300m \
+  --document-max-length 4000 \
+  --split-state-budget 16000 --split-request-budget 30000
+```
+
+This example uses threshold 0.2 and the full original candidate pool. The split
+budget defaults remain 26000 and 48000. Smaller budgets may reduce input-limit errors and
+subsequent retries, but can increase the number of requests. They change which
+documents are scored together, so listwise scores may also change. Compare
+results with the same candidate selection and document-length limit. Effective
+budgets are recorded in the summary's `model_configuration` and query details.
+Pointwise and pairwise use these budgets as preflight checks rather than
+splitting their individual requests.
 
 Pairwise compares every document pair, so a full 100-candidate run requires many more requests than a 10-candidate listwise run.
 
@@ -221,7 +258,7 @@ The model's own tokenizer and context limit apply. Pairs longer than `--max-leng
 
 ## Read the metrics
 
-For binary relevance, a relevant document at rank `r` contributes `1 / log2(r + 1)` to DCG. The script sums these contributions through rank 10, divides by the ideal DCG, and reports the arithmetic mean across all 50 queries.
+For binary relevance, a relevant document at rank `r` contributes `1 / log2(r + 1)` to DCG. The script sums these contributions through rank 10, divides by the ideal DCG, and reports the arithmetic mean across the evaluated queries. Their count depends on the dataset split and any `--query-limit`.
 
 | JSON field | Interpretation |
 | --- | --- |

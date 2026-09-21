@@ -58,7 +58,10 @@ treat them as application data when saving or sharing them. Credentials are not
 included in the library's details.
 
 Check the resolved model, prompt, scores, truncation, splits, and retries to
-understand an unexpected ranking. Do not silently relax assertions to accommodate
+understand an unexpected ranking. For built-in listwise relevance requests, read
+the full `payload.state.rubric` together with the per-document
+`payload.questions`; each question references rules stored in the state.
+Do not silently relax assertions to accommodate
 a service change. Offline tests cover deterministic error paths, malformed
 responses, retry behavior, partitioning, and lifecycle rules without real API calls.
 

@@ -76,7 +76,12 @@ def test_ranking_response_envelope(method_name, detail, case):
 def test_rank_default_zero_and_relevance_default_point_two():
     ranker, calls = scored()
     docs = ["zero", "noise", "partial", "answer"]
-    assert [r["document_index"] for r in ranker.rerank("q", docs)["results"]] == [3, 2, 1, 0]
+    assert [r["document_index"] for r in ranker.rerank("q", docs)["results"]] == [
+        3,
+        2,
+        1,
+        0,
+    ]
     result = ranker.relevance_rerank("q", docs, detail=True)
     assert [r["document_index"] for r in result["results"]] == [3, 2]
     assert result["results"][1]["score"] == 0.2
@@ -89,9 +94,7 @@ def test_rank_default_zero_and_relevance_default_point_two():
 
 def test_rerank_logs_discarded_scores_and_applies_threshold_before_top_k():
     ranker, _ = scored()
-    raw = ranker.rerank(
-        "q", ["a", "b", "c", "d"], threshold=0.2, top_k=1, detail=True
-    )
+    raw = ranker.rerank("q", ["a", "b", "c", "d"], threshold=0.2, top_k=1, detail=True)
     assert [r["document_index"] for r in raw["results"]] == [3]
     assert raw["detail"]["configuration"]["threshold"] == 0.2
     assert [d["score"] for d in raw["detail"]["documents"]] == [0.0, 0.19, 0.2, 0.9]
@@ -263,11 +266,15 @@ def test_prompt_snapshot_survives_caller_mutation_during_request():
 
 @pytest.mark.parametrize("interface", ["sync", "async"])
 @pytest.mark.parametrize("mode", ["listwise", "pointwise"])
-def test_relevance_selects_mode_specific_prompt_and_preserves_overrides(interface, mode):
+def test_relevance_selects_mode_specific_prompt_and_preserves_overrides(
+    interface, mode
+):
     from jev_reranker import POINTWISE_RELEVANCE_INSTRUCTION, RELEVANCE_INSTRUCTION
 
     expected = (
-        POINTWISE_RELEVANCE_INSTRUCTION if mode == "pointwise" else RELEVANCE_INSTRUCTION
+        POINTWISE_RELEVANCE_INSTRUCTION
+        if mode == "pointwise"
+        else RELEVANCE_INSTRUCTION
     )
     custom = {
         "instructions": "Custom evidence in {document} for `query`.",
@@ -289,9 +296,17 @@ def test_relevance_selects_mode_specific_prompt_and_preserves_overrides(interfac
     questions = [next(iter(call["questions"].values())) for call in calls]
     assert questions[0]["criteria"] == expected["criteria"]
     assert questions[1]["criteria"] == questions[2]["criteria"] == custom["criteria"]
-    assert questions[0]["instructions"] == expected["instructions"].format(
-        document="`document`" if mode == "pointwise" else "`documents.doc_0`"
-    )
+    if mode == "pointwise":
+        assert questions[0]["instructions"] == expected["instructions"].format(
+            document="`document`"
+        )
+        assert "rubric" not in calls[0]["state"]
+    else:
+        assert calls[0]["state"]["rubric"]["instructions"] == expected[
+            "instructions"
+        ].format(document="the candidate")
+        assert "`rubric`" in questions[0]["instructions"]
+    assert all("rubric" not in call["state"] for call in calls[1:])
 
 
 def test_pointwise_relevance_prompt_only_uses_single_document_context():
@@ -303,3 +318,94 @@ def test_pointwise_relevance_prompt_only_uses_single_document_context():
     for absent in ("{left}", "{right}", "other passage", "Use the pair"):
         assert absent not in prompt["instructions"]
     assert "different referent" in prompt["criteria"]["false"]
+
+
+def test_listwise_relevance_transmits_one_rubric_and_reduces_request_size():
+    import json
+
+    from jev_reranker import RELEVANCE_INSTRUCTION
+
+    ranker, calls = make()
+    documents = [f"Evidence {i}" for i in range(20)]
+    raw = ranker.relevance_rerank("question {document}", documents, detail=True)
+    assert len(calls) == 1
+    payload = calls[0]
+    rubric = payload["state"]["rubric"]
+    assert rubric == {
+        "instructions": RELEVANCE_INSTRUCTION["instructions"].format(
+            document="the candidate"
+        ),
+        "criteria": RELEVANCE_INSTRUCTION["criteria"],
+    }
+    assert payload["state"]["query"] == "question {document}"
+    for key, question in payload["questions"].items():
+        assert f"`documents.{key}`" in question["instructions"]
+        assert "`rubric`" in question["instructions"]
+        assert rubric["instructions"] not in question["instructions"]
+        assert question["criteria"] == rubric["criteria"]
+    repeated = copy.deepcopy(payload)
+    del repeated["state"]["rubric"]
+    for key, question in repeated["questions"].items():
+        question["instructions"] = RELEVANCE_INSTRUCTION["instructions"].format(
+            document=f"`documents.{key}`"
+        )
+    assert len(json.dumps(payload)) < len(json.dumps(repeated))
+    assert raw["detail"]["requests"][0]["payload"] == payload
+    assert (
+        raw["detail"]["configuration"]["instructions"]
+        == (RELEVANCE_INSTRUCTION["instructions"])
+    )
+    payload["state"]["rubric"]["criteria"]["true"] = "changed"
+    assert RELEVANCE_INSTRUCTION["criteria"]["true"] != "changed"
+
+
+def test_modified_relevance_preset_keeps_custom_document_instructions():
+    from jev_reranker import RELEVANCE_INSTRUCTION
+
+    custom = copy.deepcopy(RELEVANCE_INSTRUCTION)
+    custom["instructions"] += " Require direct evidence."
+    ranker, calls = make()
+    ranker.relevance_rerank("q", ["a"], instruction=custom)
+    assert "rubric" not in calls[0]["state"]
+    assert calls[0]["questions"]["doc_0"]["instructions"] == custom[
+        "instructions"
+    ].format(document="`documents.doc_0`")
+    ranker.rerank("q", ["a"])
+    assert "rubric" not in calls[1]["state"]
+
+
+def test_listwise_relevance_split_accounts_for_rubric_and_maps_filtered_scores():
+    from jev_reranker import RELEVANCE_INSTRUCTION
+
+    def handle(payload, *_):
+        return httpx.Response(
+            200,
+            json=response(
+                payload,
+                {
+                    key: 0.8 if int(key.removeprefix("doc_")) % 2 else 0.1
+                    for key in payload["questions"]
+                },
+            ),
+        )
+
+    ranker, calls = make(handle, split_state_budget=3500, split_request_budget=5000)
+    documents = [f"Evidence {i}: " + "根拠" * 100 for i in range(24)]
+    raw = ranker.relevance_rerank("q", documents, detail=True)
+    assert len(calls) > 1
+    indices = []
+    for payload in calls:
+        assert (
+            payload["state"]["rubric"]["criteria"]
+            == (RELEVANCE_INSTRUCTION["criteria"])
+        )
+        estimates = ranker._estimate(payload)
+        assert estimates["state_plus_longest_question"] <= 3500
+        assert estimates["request"] <= 5000
+        for key, text in payload["state"]["documents"].items():
+            index = int(key.removeprefix("doc_"))
+            assert text == documents[index]
+            indices.append(index)
+    assert sorted(indices) == list(range(24))
+    assert [row["document_index"] for row in raw["results"]] == list(range(1, 24, 2))
+    assert all(row["score"] == 0.8 for row in raw["results"])
