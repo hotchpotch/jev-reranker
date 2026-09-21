@@ -9,6 +9,7 @@ import math
 import os
 import platform
 import time
+from collections import OrderedDict
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -316,6 +317,9 @@ class JevReranker:
             else ("characters" if self._length_fn is len else "custom")
         )
         self._tokenizer_lock = Lock()
+        self._count_cache: OrderedDict[str, int] = OrderedDict()
+        self._count_cache_size = 0
+        self._count_cache_limit = 4_000_000
         self._runtime = Runtime(max_concurrency, client, transport)
 
     def close(self) -> None:
@@ -576,9 +580,28 @@ class JevReranker:
                 ) from None
         return self._tokenizer
 
+    def _remember_count(self, text: str, count: int) -> int:
+        # Caller holds the tokenizer lock. Bound both retained text and entries.
+        if len(text) <= self._count_cache_limit:
+            if text in self._count_cache:
+                self._count_cache.move_to_end(text)
+            else:
+                self._count_cache_size += len(text)
+            self._count_cache[text] = count
+            while (
+                self._count_cache_size > self._count_cache_limit
+                or len(self._count_cache) > 2048
+            ):
+                removed, _ = self._count_cache.popitem(last=False)
+                self._count_cache_size -= len(removed)
+        return count
+
     def _count_locked(self, text: str) -> int:
         if self._length_fn is None:
-            return len(self._get_tokenizer().encode(text))
+            if text in self._count_cache:
+                self._count_cache.move_to_end(text)
+                return self._count_cache[text]
+            return self._remember_count(text, len(self._get_tokenizer().encode(text)))
         try:
             value = self._length_fn(text)
         except Exception:  # noqa: BLE001 - user callback failures need a stable public exception
@@ -591,7 +614,7 @@ class JevReranker:
         with self._tokenizer_lock:
             return self._count_locked(text)
 
-    def _truncate(self, text: str, limit: int) -> str:
+    def _truncate(self, text: str, limit: int, tokens: list[int] | None = None) -> str:
         # Caller holds the counter/tokenizer lock.
         if self._length_fn is len:
             return text[:limit]
@@ -610,7 +633,7 @@ class JevReranker:
             # Safe prefix; not necessarily the longest for nonmonotonic counters.
             return text[:low]
         tokenizer = self._get_tokenizer()
-        tokens = tokenizer.encode(text)[:limit]
+        tokens = (tokenizer.encode(text) if tokens is None else tokens)[:limit]
         while True:
             decoded = tokenizer.decode(tokens)
             length = self._count_locked(decoded)
@@ -626,11 +649,16 @@ class JevReranker:
         prepared = []
         with self._tokenizer_lock:
             for index, original in enumerate(docs):
-                original_count = self._count_locked(original)
+                tokens = None
+                if self._length_fn is None and original not in self._count_cache:
+                    tokens = self._get_tokenizer().encode(original)
+                    original_count = self._remember_count(original, len(tokens))
+                else:
+                    original_count = self._count_locked(original)
                 text = original
                 limit = self.document_max_length
                 if limit is not None and original_count > limit:
-                    text = self._truncate(original, limit)
+                    text = self._truncate(original, limit, tokens)
                 sent_count = self._count_locked(text)
                 if limit is not None and sent_count > limit:
                     raise ConfigurationError(
@@ -727,10 +755,10 @@ class JevReranker:
         payload: dict[str, Any],
         indices: list[int],
         run: _Run,
+        estimated: dict[str, int],
     ) -> list[float]:
         trace: dict[str, Any] = {}
         if run.detailed:
-            estimated = await self._estimate_async(payload)
             trace.update(
                 id=len(run.requests),
                 document_indices=indices,
@@ -772,6 +800,20 @@ class JevReranker:
         def payload(indices: list[int]) -> dict[str, Any]:
             return self._payload(query, docs, indices, run.instruction)
 
+        # Per-call keys preserve document order: JSON tokenization can depend on it.
+        estimates: dict[tuple[int, ...], dict[str, int]] = {}
+
+        async def estimate_group(indices: list[int]) -> dict[str, int]:
+            key = tuple(indices)
+            if key not in estimates:
+                estimates[key] = await self._estimate_async(payload(indices))
+            return estimates[key]
+
+        async def request_group(indices: list[int]) -> list[float]:
+            return await self._request(
+                payload(indices), indices, run, await estimate_group(indices)
+            )
+
         async def score_one(indices: list[int]) -> list[float]:
             body = payload(indices)
             estimate = await self._estimate_async(body)
@@ -782,7 +824,7 @@ class JevReranker:
                 raise ContextLimitError(
                     f"Query and document group {indices} exceed the estimated context budget."
                 )
-            return await self._request(body, indices, run)
+            return await self._request(body, indices, run, estimate)
 
         if self.mode == "listwise":
             lengths = await asyncio.to_thread(lambda: [self._count(d) for d in docs])
@@ -791,8 +833,8 @@ class JevReranker:
                 lengths=lengths,
                 state_budget=self.split_state_budget,
                 request_budget=self.split_request_budget,
-                estimate=lambda ids: self._estimate_async(payload(ids)),
-                request=lambda ids: self._request(payload(ids), ids, run),
+                estimate=estimate_group,
+                request=request_group,
                 splits=run.splits,
             )
         scores = [0.0] * len(docs)
