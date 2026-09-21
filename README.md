@@ -365,12 +365,18 @@ uv add 'jev-reranker[tokenizer]'
 reranker = JevReranker(
     api_key="YOUR-TYPESAFE-API-KEY...",
     tokenizer="google/embeddinggemma-300m",
-    document_max_length=8000,  # 8000 tokens here; the default is 4000 tokens.
-    split_state_budget=26000,
-    split_request_budget=48000,
+    document_max_length=4000,  # Measured in Gemma tokens.
+    split_state_budget=16000,
+    split_request_budget=30000,
 )
-results = reranker.rerank("query", ["document"])
+response = reranker.relevance_rerank("query", ["document"], threshold=0.2)
+results = response["results"]
 ```
+
+This example uses explicit split budgets of 16000 and 30000 for more conservative
+request grouping with Gemma token counting. The defaults remain 26000 and 48000.
+Gemma counts are local estimates; these settings do not guarantee that requests
+fit the provider's context limit. Grouping can also affect listwise scores.
 
 Only the tokenizer is fetched on first scoring. Gemma license acceptance and Hugging Face authentication such as `HF_TOKEN` may be required. No model weights, PyTorch, or GPU are needed. The default Gemma revision is pinned; override it with `split_tokenizer_revision="main"`, for example. Other Hub repositories, local `tokenizer.json` files, and objects implementing `encode(text)` / `decode(ids)` are supported. Supplying your own object does not require this library's tokenizer extra.
 

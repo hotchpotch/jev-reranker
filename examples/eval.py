@@ -10,6 +10,11 @@ Run from this repository's root:
     # Standard reranking: --task rerank (default), threshold 0.0.
     # Override either cutoff with --threshold 0.33. Kept scores satisfy >= cutoff.
 
+    # Relevance with Gemma token counting and explicit, smaller split budgets.
+    uv run --locked --group examples --extra tokenizer python examples/eval.py \
+        --task relevance --tokenizer google/embeddinggemma-300m \
+        --document-max-length 4000 --split-state-budget 16000 --split-request-budget 30000
+
     # Japanese, using every original hybrid candidate (100 or 101 per query).
     uv run --locked --group examples --extra tokenizer python examples/eval.py --target ja --top-k none
 
@@ -32,8 +37,9 @@ Installation:
 Candidates and targets:
     --target en (default) or ja selects a pinned dataset revision; --split defaults
     to NanoHotpotQA. Use --split for another benchmark. --dataset requires --revision
-    for another compatible dataset repository. The loader requires 50 queries,
-    100/101 hybrid candidates each, and positive-only qrels in the preset parquet layout.
+    for another compatible dataset repository. All dataset queries are evaluated
+    unless --query-limit N is specified. The loader requires 100/101 hybrid
+    candidates each and positive-only qrels in the preset parquet layout.
     Browse Nano-set datasets: https://huggingface.co/hakari-bench/datasets?search=nano
     --top-k defaults to none (no candidate limit). A positive count includes ALL
     qrels positives and fills
@@ -55,11 +61,14 @@ Backend settings:
     Sentence Transformers defaults: BAAI/bge-reranker-v2-m3, automatic device,
     float32, batch size 16, and the model's pair-token limit. Scores are raw logits;
     ties retain input order. Queries run serially, with batched pairs within each query.
+    --split-state-budget (26000) and --split-request-budget (48000) control
+    local length estimates for grouping requests, in the selected counter units.
     --mode / --tokenizer / --document-max-length / --concurrency are Jev settings;
     CrossEncoder uses its own tokenizer and --max-length for query+document pairs.
 
 Metrics and output:
-    ndcg_at_10 uses ALL qrels positives for its ideal ranking, averaged over 50 queries.
+    ndcg_at_10 uses ALL qrels positives for its ideal ranking, averaged over
+    the evaluated queries.
     candidate_ndcg_at_10 uses positives within the selected pool. They agree when all
     positives are included; unfiltered pools may have a lower attainable oracle score.
     nDCG is computed AFTER filtering; unfiltered_ndcg_at_10 records the same run
@@ -253,8 +262,8 @@ def load_data(cache, revision, dataset=DATASET, split=SPLIT):
     for row in tables["qrels"]:
         qrels[row["query-id"]].add(row["corpus-id"])
     hybrid = {r["query-id"]: r["corpus-ids"] for r in tables["reranking_hybrid"]}
-    if len(queries) != 50 or set(queries) != set(hybrid):
-        raise ValueError("Expected exactly 50 matching query and hybrid rows")
+    if not queries or set(queries) != set(hybrid):
+        raise ValueError("Expected nonempty matching query and hybrid rows")
     for qid in queries:
         if len(hybrid[qid]) not in (100, 101):
             raise ValueError(f"Expected 100/101 candidates for {qid}")
@@ -262,6 +271,54 @@ def load_data(cache, revision, dataset=DATASET, split=SPLIT):
         if not (set(hybrid[qid]) | qrels[qid]).issubset(corpus):
             raise ValueError(f"Missing corpus documents for {qid}")
     return queries, corpus, qrels, hybrid, hashes
+
+
+def test_loader_accepts_variable_query_counts_and_checks_alignment(
+    tmp_path, monkeypatch
+):
+    import importlib
+    from types import SimpleNamespace
+
+    import pytest
+
+    tables = {}
+    original_import = importlib.import_module
+
+    def read_table(path):
+        return SimpleNamespace(to_pylist=lambda: tables[path.stem])
+
+    monkeypatch.setattr(
+        importlib,
+        "import_module",
+        lambda name: (
+            SimpleNamespace(read_table=read_table)
+            if name == "pyarrow.parquet"
+            else original_import(name)
+        ),
+    )
+    cache = tmp_path / DATASET.replace("/", "--") / SPLIT / REVISION
+    cache.mkdir(parents=True)
+    for config in ("queries", "corpus", "qrels", "reranking_hybrid"):
+        (cache / f"{config}.parquet").write_bytes(b"offline fixture")
+    tables["corpus"] = [{"_id": str(i), "text": "document"} for i in range(100)]
+    for count in (1, 50, 200):
+        tables["queries"] = [{"_id": str(i), "text": "query"} for i in range(count)]
+        tables["qrels"] = [{"query-id": str(i), "corpus-id": "0"} for i in range(count)]
+        tables["reranking_hybrid"] = [
+            {"query-id": str(i), "corpus-ids": [str(j) for j in range(100)]}
+            for i in range(count)
+        ]
+        queries, _, _, hybrid, hashes = load_data(tmp_path, REVISION)
+        assert len(queries) == count
+        assert set(queries) == set(hybrid)
+        assert len(hashes) == 4
+    tables["reranking_hybrid"].pop()
+    with pytest.raises(ValueError, match="matching query and hybrid"):
+        load_data(tmp_path, REVISION)
+    for config in ("queries", "qrels", "reranking_hybrid"):
+        tables[config] = []
+    with pytest.raises(ValueError, match="nonempty"):
+        load_data(tmp_path, REVISION)
 
 
 def cross_encoder_results(scores, count):
@@ -412,6 +469,8 @@ async def evaluate(args, root):
     queries, corpus, qrels, hybrid, hashes = load_data(
         args.cache, args.revision, args.dataset, args.split
     )
+    dataset_query_count = len(queries)
+    queries = {qid: queries[qid] for qid in sorted(queries)[: args.query_limit]}
     args.output.mkdir(parents=True, exist_ok=False)
     jobs = prepare_jobs(queries, hybrid, qrels, args.seed, args.top_k)
     manifest = {
@@ -423,7 +482,10 @@ async def evaluate(args, root):
         "split": args.split,
         "file_sha256": hashes,
         "seed": args.seed,
-        "query_count": 50,
+        "query_count": len(jobs),
+        "dataset_query_count": dataset_query_count,
+        "query_limit": args.query_limit,
+        "query_selection": "first query IDs in sorted order, up to query_limit",
         "documents_per_query": args.top_k,
         "candidate_count_min": min(len(d) for _, _, d in jobs),
         "candidate_count_max": max(len(d) for _, _, d in jobs),
@@ -459,6 +521,8 @@ async def evaluate(args, root):
             model=args.model,
             tokenizer=None if args.tokenizer == "none" else args.tokenizer,
             document_max_length=args.document_max_length,
+            split_state_budget=args.split_state_budget,
+            split_request_budget=args.split_request_budget,
             max_concurrency=args.concurrency,
         )
     async with ranker as reranker:
@@ -530,7 +594,7 @@ async def evaluate(args, root):
             )
             rows.append(row)
             print(
-                f"{len(rows):2}/50 {qid} nDCG@10={row['ndcg_at_10']:.6f} "
+                f"{len(rows):2}/{len(jobs)} {qid} nDCG@10={row['ndcg_at_10']:.6f} "
                 f"kept={len(ranking)}/{len(shuffled)} positives_removed={filtering['positives_removed']}",
                 flush=True,
             )
@@ -568,6 +632,8 @@ async def evaluate(args, root):
     totals["empty_result_queries"] = sum(not row["ranking"] for row in rows)
     summary = {
         "query_count": len(rows),
+        "dataset_query_count": dataset_query_count,
+        "query_limit": args.query_limit,
         "filtering": totals,
         "backend": args.backend,
         "task": args.task,
@@ -644,6 +710,12 @@ def main():
         default=None,
         help="CrossEncoder model revision (not dataset revision)",
     )
+    parser.add_argument(
+        "--query-limit",
+        type=int,
+        default=None,
+        help="Evaluate at most N queries in sorted ID order; default all queries",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--target", choices=tuple(TARGETS), default="en", help="NanoBEIR language"
@@ -677,6 +749,18 @@ def main():
         help="Hub name or 'none' for len",
     )
     parser.add_argument("--document-max-length", type=int, default=4000)
+    parser.add_argument(
+        "--split-state-budget",
+        type=int,
+        default=26000,
+        help="Jev estimated state plus longest question budget, in counter units",
+    )
+    parser.add_argument(
+        "--split-request-budget",
+        type=int,
+        default=48000,
+        help="Jev estimated whole-request budget, in counter units",
+    )
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--cache", type=Path, default=root / ".cache/hotpotqa")
     parser.add_argument(
@@ -706,6 +790,10 @@ def main():
     args.revision = args.revision or target_revision
     if args.batch_size < 1 or (args.max_length is not None and args.max_length < 1):
         parser.error("--batch-size and --max-length must be positive")
+    if args.query_limit is not None and args.query_limit < 1:
+        parser.error("--query-limit must be positive")
+    if args.split_state_budget < 1 or args.split_request_budget < 1:
+        parser.error("--split-state-budget and --split-request-budget must be positive")
     if args.concurrency < 1:
         parser.error("--concurrency must be positive")
     asyncio.run(evaluate(args, root))
@@ -726,7 +814,7 @@ def test_evaluation_maps_shuffled_indices_and_writes_complete_run(
     sys.path.insert(0, str(root / "src"))
     import jev_reranker
 
-    queries = {str(i): "query" for i in range(50)}
+    queries = {str(i): "query" for i in range(200)}
     corpus = {str(i): f"document {i}" for i in range(101)}
     qrels = {q: {"99"} for q in queries}
     hybrid = {q: list(corpus)[: 100 + int(q) % 2] for q in queries}
@@ -743,8 +831,9 @@ def test_evaluation_maps_shuffled_indices_and_writes_complete_run(
             "instructions"
         ].startswith(("Score how useful", "How useful is"))
         if "document" in body["state"] and is_relevance:
-            assert body["questions"]["relevant"]["criteria"] == (
-                jev_reranker.POINTWISE_RELEVANCE_INSTRUCTION["criteria"]
+            assert (
+                body["questions"]["relevant"]["criteria"]
+                == (jev_reranker.POINTWISE_RELEVANCE_INSTRUCTION["criteria"])
             )
         documents = body["state"].get("documents")
         if documents is None:
@@ -786,6 +875,7 @@ def test_evaluation_maps_shuffled_indices_and_writes_complete_run(
         dataset=DATASET,
         split=SPLIT,
         top_k=10,
+        query_limit=None,
         output=tmp_path / "run",
         seed=42,
         concurrency=4,
@@ -793,41 +883,53 @@ def test_evaluation_maps_shuffled_indices_and_writes_complete_run(
         model=None,
         tokenizer="none",
         document_max_length=4000,
+        split_state_budget=16000,
+        split_request_budget=30000,
     )
-    for count, task, threshold, mode in (
-        (10, "rerank", 0.0, "listwise"),
-        (None, "rerank", 0.0, "listwise"),
-        (10, "relevance", 0.2, "listwise"),
-        (10, "relevance", 0.1, "listwise"),
-        (10, "relevance", 0.2, "pointwise"),
-        (10, "relevance", 0.1, "pointwise"),
+    for count, task, threshold, mode, limit in (
+        (10, "rerank", 0.0, "listwise", None),
+        (None, "rerank", 0.0, "listwise", 50),
+        (10, "relevance", 0.2, "listwise", 300),
+        (10, "relevance", 0.1, "listwise", 1),
+        (10, "relevance", 0.2, "pointwise", 10),
+        (10, "relevance", 0.1, "pointwise", 10),
     ):
+        args.query_limit = limit
+        expected_count = min(limit or 200, 200)
         args.top_k, args.task, args.threshold, args.mode = count, task, threshold, mode
         args.output = tmp_path / f"run-{count}-{task}-{threshold}-{mode}"
         asyncio.run(evaluate(args, root))
         summary = json.loads((args.output / "summary.json").read_text())
         loses_positive = task == "relevance" and threshold == 0.2
-        assert summary["query_count"] == 50
+        assert summary["query_count"] == expected_count
+        manifest = json.loads((args.output / "manifest.json").read_text())
+        for record in (manifest, summary):
+            assert record["query_count"] == expected_count
+            assert record["dataset_query_count"] == 200
+            assert record["query_limit"] == limit
+        assert [q["query_id"] for q in manifest["queries"]] == sorted(queries)[:limit]
+        assert summary["model_configuration"]["split_state_budget"] == 16000
+        assert summary["model_configuration"]["split_request_budget"] == 30000
         assert summary["ndcg_at_10"] == (0 if loses_positive else 1)
         assert summary["unfiltered_ndcg_at_10"] == 1
-        assert summary["positive_promoted_queries"] == (50 if count else 0)
+        assert summary["positive_promoted_queries"] == (expected_count if count else 0)
         assert summary["candidate_count_min"] == (10 if count else 100)
         assert summary["candidate_count_max"] == (10 if count else 101)
-        assert len(list(args.output.glob("*.json"))) == 52
+        assert len(list(args.output.glob("*.json"))) == expected_count + 2
         assert summary["filtering"]["positives_removed"] == (
-            50 if loses_positive else 0
+            expected_count if loses_positive else 0
         )
         assert summary["filtering"]["positive_retention_rate"] == (
             0 if loses_positive else 1
         )
         assert summary["filtering"]["empty_result_queries"] == (
-            50 if loses_positive else 0
+            expected_count if loses_positive else 0
         )
         if task == "rerank":
             assert summary["filtering"]["documents_removed"] == 0
         else:
             assert summary["filtering"]["documents_retained"] == (
-                0 if loses_positive else 50
+                0 if loses_positive else expected_count
             )
         row = json.loads((args.output / "0.json").read_text())
         if loses_positive:
@@ -924,6 +1026,56 @@ def test_cli_default_has_no_candidate_limit(monkeypatch):
         monkeypatch.setattr(sys, "argv", ["eval.py", *options])
         main()
     assert seen == [None, 10, None]
+
+
+def test_cli_split_budgets_defaults_overrides_and_validation(monkeypatch):
+    import sys
+
+    import pytest
+
+    seen = []
+
+    async def capture(args, root):
+        seen.append((args.split_state_budget, args.split_request_budget))
+
+    monkeypatch.setitem(main.__globals__, "evaluate", capture)
+    for options in (
+        [],
+        ["--split-state-budget", "16000"],
+        ["--split-request-budget", "30000"],
+        ["--split-state-budget", "16000", "--split-request-budget", "30000"],
+    ):
+        monkeypatch.setattr(sys, "argv", ["eval.py", *options])
+        main()
+    assert seen == [(26000, 48000), (16000, 48000), (26000, 30000), (16000, 30000)]
+    for option in ("--split-state-budget", "--split-request-budget"):
+        for value in ("0", "-1", "1.5"):
+            monkeypatch.setattr(sys, "argv", ["eval.py", option, value])
+            with pytest.raises(SystemExit) as error:
+                main()
+            assert error.value.code == 2
+
+
+def test_cli_query_limit_defaults_and_validation(monkeypatch):
+    import sys
+
+    import pytest
+
+    seen = []
+
+    async def capture(args, root):
+        seen.append(args.query_limit)
+
+    monkeypatch.setitem(main.__globals__, "evaluate", capture)
+    for options in ([], ["--query-limit", "50"]):
+        monkeypatch.setattr(sys, "argv", ["eval.py", *options])
+        main()
+    assert seen == [None, 50]
+    for value in ("0", "-1", "none", "1.5"):
+        monkeypatch.setattr(sys, "argv", ["eval.py", "--query-limit", value])
+        with pytest.raises(SystemExit) as error:
+            main()
+        assert error.value.code == 2
 
 
 def test_filter_statistics_separates_retrieval_misses_from_removed_positives():
