@@ -42,6 +42,13 @@ to use the controlled ten-candidate policy described below.
 The relevance task selects `RELEVANCE_INSTRUCTION` for listwise and
 `POINTWISE_RELEVANCE_INSTRUCTION` for pointwise through `a_relevance_rerank()`. It retains the full scoring detail so discarded positives can be audited. It supports listwise and pointwise, not pairwise. The task and threshold options are Jev-only: CrossEncoder scores are raw logits, so the Sentence Transformers backend remains unfiltered and rejects relevance/threshold options.
 
+The built-in listwise relevance prompt automatically stores its full rubric once
+per request and uses shorter per-document references. No additional CLI flag is
+needed. When inspecting request details, read both `payload.state.rubric` and
+`payload.questions`; the questions alone do not contain all evaluation rules.
+Prompt and grouping changes can affect scores, so record the package version and
+effective prompt when comparing runs.
+
 To score each document independently with the dedicated pointwise relevance prompt:
 
 ```sh
@@ -251,7 +258,7 @@ The model's own tokenizer and context limit apply. Pairs longer than `--max-leng
 
 ## Read the metrics
 
-For binary relevance, a relevant document at rank `r` contributes `1 / log2(r + 1)` to DCG. The script sums these contributions through rank 10, divides by the ideal DCG, and reports the arithmetic mean across all 50 queries.
+For binary relevance, a relevant document at rank `r` contributes `1 / log2(r + 1)` to DCG. The script sums these contributions through rank 10, divides by the ideal DCG, and reports the arithmetic mean across the evaluated queries. Their count depends on the dataset split and any `--query-limit`.
 
 | JSON field | Interpretation |
 | --- | --- |

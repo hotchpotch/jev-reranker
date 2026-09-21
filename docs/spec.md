@@ -22,6 +22,21 @@ Accept `instruction=` on the constructor and each call. Preserve legacy construc
 
 `relevance_rerank` selects `RELEVANCE_INSTRUCTION` for listwise and `POINTWISE_RELEVANCE_INSTRUCTION` for pointwise, then passes that preset and default `threshold=0.2` through `rerank`. The async path is `a_relevance_rerank` → `a_rerank`. Reuse scoring, partitioning, and error handling; do not provide a separate relevance HTTP implementation or `relevance_filter` method. A per-call instruction overrides the relevance preset. Relevance evaluates absolute usefulness as evidence and supports listwise/pointwise; pairwise's relative win probability raises `ConfigurationError` here.
 
+When a listwise instruction equals the unmodified built-in relevance preset,
+store its full instructions and criteria once in `state.rubric`, formatting
+`{document}` as `the candidate`. Each `doc_i` question uses a shorter reference
+to `documents.doc_i`, `query`, and `rubric`, with explicit true/false criteria.
+This also applies when callers explicitly pass an unchanged copy of the preset.
+Modified or custom instructions retain full per-document formatting. Ordinary
+reranking and pointwise request formats are unchanged. No new public option is
+required. Count the rubric as part of the state when estimating request budgets.
+
+The listwise preset combines evidence usefulness with retrieval relevance and
+asks for a consistent evidence scale across candidate sets. Numeric anchors are
+prompt instructions, not runtime score transformations or calibration guarantees.
+Details keep the full effective template in `configuration.instructions` and
+record the submitted rubric and reference questions in each request's payload.
+
 Ordinary reranking methods default to `threshold=0.0`. Accept only finite numeric thresholds in [0, 1], excluding booleans. Select scored candidates satisfying `score >= threshold`, sort them stably, then apply `top_k`. Do not transform, round, or recalibrate scores. Thresholds change downstream output, not request contents, scored candidates, or billable work. Zero scores survive threshold zero. If all candidates are rejected, return `{"results": []}` and retain top-level execution details when `detail=True`. Empty input and `top_k=0` still make no requests.
 
 The relevance preset credits direct answers, partial answers, concrete linking facts,

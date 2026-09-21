@@ -28,6 +28,8 @@ from ._ranking import SHUFFLE_SEED, score_listwise
 from ._runtime import Runtime, require_sync_context
 from .errors import ConfigurationError, ContextLimitError, JevError
 from .instructions import (
+    _LISTWISE_RELEVANCE_INSTRUCTION,
+    _LISTWISE_RELEVANCE_REFERENCE,
     CRITERIA,
     INSTRUCTIONS,
     PAIRWISE_CRITERIA,
@@ -688,8 +690,21 @@ class JevReranker:
                 "query": query,
                 "documents": {f"doc_{i}": docs[i] for i in indices},
             }
+            question_instruction = instruction
+            if instruction == _LISTWISE_RELEVANCE_INSTRUCTION:
+                rubric = copy.deepcopy(instruction)
+                rubric["instructions"] = rubric["instructions"].format(
+                    document="the candidate"
+                )
+                state = {"rubric": rubric, **state}
+                question_instruction = {
+                    "instructions": _LISTWISE_RELEVANCE_REFERENCE,
+                    "criteria": instruction["criteria"],
+                }
             questions = {
-                f"doc_{i}": self._question(instruction, document=f"`documents.doc_{i}`")
+                f"doc_{i}": self._question(
+                    question_instruction, document=f"`documents.doc_{i}`"
+                )
                 for i in indices
             }
         return {"model": self.model, "state": state, "questions": questions}

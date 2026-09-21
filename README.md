@@ -241,6 +241,18 @@ Use `api_key_env=` to read a different environment variable name.
 `RELEVANCE_INSTRUCTION`; explicit `pointwise` uses `POINTWISE_RELEVANCE_INSTRUCTION`.
 The latter judges each document without assuming access to other candidates.
 Both default to threshold 0.2, and an explicit per-call `instruction=` takes precedence.
+For the unmodified listwise relevance preset, each request stores the full
+evaluation rubric once in its state. Each document question uses a shorter
+reference and explicit true/false criteria. This reduces repeated prompt text;
+the request budget includes both the rubric and the document questions.
+This happens automatically; existing calls need no new arguments or flags.
+Passing an unchanged copy of `RELEVANCE_INSTRUCTION` uses the same request format.
+The preset uses an absolute evidence scale and retains partial or linking facts
+while preferring evidence that addresses the requested information.
+Different prompts and request groups can change scores and filtering decisions;
+check the threshold on your data. Modified or custom instructions are formatted
+in full for each document, and pointwise scoring keeps its single-document prompt.
+
 `rerank()` uses `RERANK_INSTRUCTION` for listwise and pointwise scoring.
 It asks whether a document helps answer the query and prefers specific facts,
 without prescribing numeric score anchors.
@@ -480,6 +492,11 @@ Path("rerank-log.json").write_text(
 ```
 
 `response["detail"]` records effective settings, Python/dependency versions, requested/resolved models, tokenizer revision, usage, retries, splits, submitted state/questions, and responses. Per-result `detail` contains `original_length`, `sent_length`, `length_unit`, related request IDs, and pairwise comparisons. `rerank(..., detail=True)` and `relevance_rerank(..., detail=True)` return the same full execution record, including excluded documents.
+
+For the built-in listwise relevance preset, `detail["configuration"]["instructions"]`
+contains the full rule template. In each entry of `detail["requests"]`, inspect
+`payload["state"]["rubric"]` together with `payload["questions"]` to see the complete
+submitted prompt; the per-document question alone contains only its reference.
 
 Detail `schema_version` is 2. `usage.input_tokens` and `output_tokens` are API-reported token counts, distinct from local length estimates. Logs include document text but exclude API keys, authentication headers, and arbitrary environment variables.
 

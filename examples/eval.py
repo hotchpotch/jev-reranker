@@ -827,9 +827,10 @@ def test_evaluation_maps_shuffled_indices_and_writes_complete_run(
 
     def respond(request):
         body = json.loads(request.content)
-        is_relevance = next(iter(body["questions"].values()))[
-            "instructions"
-        ].startswith(("Score how useful", "How useful is"))
+        is_relevance = next(iter(body["questions"].values()))["criteria"] in (
+            jev_reranker.RELEVANCE_INSTRUCTION["criteria"],
+            jev_reranker.POINTWISE_RELEVANCE_INSTRUCTION["criteria"],
+        )
         if "document" in body["state"] and is_relevance:
             assert (
                 body["questions"]["relevant"]["criteria"]
