@@ -121,8 +121,11 @@ def test_async_concurrency_bound_and_input_ties():
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("mode", ["listwise", "pointwise", "pairwise"])
-def test_cancellation_cleans_children_and_releases_permits(mode):
+@pytest.mark.parametrize(
+    "mode, split_listwise",
+    [("listwise", False), ("listwise", True), ("pointwise", False), ("pairwise", False)],
+)
+def test_cancellation_cleans_children_and_releases_permits(mode, split_listwise):
     async def scenario():
         entered = asyncio.Event()
         block = True
@@ -139,9 +142,19 @@ def test_cancellation_cleans_children_and_releases_permits(mode):
             finally:
                 active -= 1
 
-        ranker, _ = make_async(handler, mode=mode, max_concurrency=2)
+        limits = (
+            {"split_state_budget": 1800, "split_request_budget": 3000}
+            if split_listwise
+            else {}
+        )
+        ranker, _ = make_async(handler, mode=mode, max_concurrency=2, **limits)
+        documents = (
+            [f"{i}:" + "x" * 1000 for i in range(6)]
+            if split_listwise
+            else ["a"] * 20
+        )
         async with ranker:
-            task = asyncio.create_task(ranker.a_rerank("q", ["a"] * 20))
+            task = asyncio.create_task(ranker.a_rerank("q", documents))
             await asyncio.wait_for(entered.wait(), 2)
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
@@ -153,13 +166,19 @@ def test_cancellation_cleans_children_and_releases_permits(mode):
     asyncio.run(scenario())
 
 
-def test_failure_cancels_siblings_without_exception_group():
+@pytest.mark.parametrize("mode", ["pointwise", "listwise"])
+def test_failure_cancels_siblings_without_exception_group(mode):
     async def scenario():
         slow_started = asyncio.Event()
         slow_stopped = asyncio.Event()
 
         async def handler(p, n, r):
-            if p["state"]["document"] == "bad":
+            document = (
+                p["state"]["document"]
+                if mode == "pointwise"
+                else next(iter(p["state"]["documents"].values()))
+            )
+            if document.startswith("bad"):
                 await slow_started.wait()
                 return httpx.Response(401)
             slow_started.set()
@@ -168,15 +187,85 @@ def test_failure_cancels_siblings_without_exception_group():
             finally:
                 slow_stopped.set()
 
-        ranker, _ = make_async(handler, mode="pointwise", max_concurrency=2)
+        ranker, _ = make_async(
+            handler,
+            mode=mode,
+            max_concurrency=2,
+            split_state_budget=1800,
+            split_request_budget=3000,
+        )
         async with ranker:
             with pytest.raises(APIError) as exc:
                 await asyncio.wait_for(
-                    ranker.a_rerank("q", ["bad", "slow"], detail=True), 2
+                    ranker.a_rerank(
+                        "q", ["bad" + "x" * 1000, "slow" + "x" * 1000], detail=True
+                    ),
+                    2,
                 )
             assert exc.value.status_code == 401
             assert exc.value.detail is not None
             assert slow_stopped.is_set()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("server_overflow", [False, True])
+def test_listwise_split_groups_overlap_with_bounded_http_and_stable_scores(server_overflow):
+    async def scenario():
+        overlap, release = asyncio.Event(), asyncio.Event()
+        active = maximum = 0
+        documents = [f"{i}:" + "x" * 1000 for i in range(6)]
+
+        async def handler(p, n, r):
+            nonlocal active, maximum
+            if server_overflow and len(p["questions"]) > 1:
+                return httpx.Response(
+                    422, json={"detail": {"error_type": "max_tokens_exceeded"}}
+                )
+            active += 1
+            maximum = max(maximum, active)
+            if active == 2:
+                overlap.set()
+            try:
+                await release.wait()
+                return httpx.Response(
+                    200,
+                    json=response(p, {
+                        key: 0.8 if int(key.removeprefix("doc_")) % 2 else 0.2
+                        for key in p["questions"]
+                    }),
+                )
+            finally:
+                active -= 1
+
+        ranker, calls = make_async(
+            handler,
+            max_concurrency=2,
+            split_state_budget=20000 if server_overflow else 1800,
+            split_request_budget=50000 if server_overflow else 3000,
+        )
+        async with ranker:
+            task = asyncio.create_task(ranker.a_rerank("q", documents, detail=True))
+            try:
+                await asyncio.wait_for(overlap.wait(), 2)
+                release.set()
+                raw = await asyncio.wait_for(task, 2)
+            finally:
+                release.set()
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+        assert maximum == 2
+        assert active == 0
+        assert [r["document_index"] for r in raw["results"]] == [1, 3, 5, 0, 2, 4]
+        assert [r["score"] for r in raw["results"]] == [0.8] * 3 + [0.2] * 3
+        successful = [p for p in calls if len(p["questions"]) == 1]
+        assert len(successful) == len(documents)
+        assert sorted(
+            text for p in successful for text in p["state"]["documents"].values()
+        ) == documents
+        assert raw["detail"]["usage"]["attempts"] == len(calls)
+        assert bool(raw["detail"]["usage"]["max_tokens_errors"]) == server_overflow
 
     asyncio.run(scenario())
 

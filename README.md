@@ -348,7 +348,7 @@ Each call owns a separate, lazily created HTTP client. Success, failure, and
 cancellation all close it before the call finishes. A context-local call state
 keeps concurrent requests separate. No explicit shutdown is needed for normal use.
 
-HTTP concurrency is bounded across the entire instance. Pointwise uses worker tasks, pairwise processes bounded groups of tasks, and listwise chunks run sequentially. Retries use `asyncio.sleep`. Synchronous tokenizer loading and counting use `asyncio.to_thread`.
+HTTP concurrency is bounded across the entire instance. Pointwise uses worker tasks, pairwise processes bounded groups of tasks, and listwise split groups run concurrently through the same HTTP limit. Retries use `asyncio.sleep`. Synchronous tokenizer loading and counting use `asyncio.to_thread`.
 
 Cancellation drains child tasks before propagating `asyncio.CancelledError`. HTTP failures also drain children and preserve public `JevError` exceptions rather than wrapping them in `ExceptionGroup`. `aclose()` and `close()` remain optional compatibility methods: they reject new work and wait for active calls, whose resources are cleaned up automatically. Cancel caller tasks first if you need to stop active work early.
 
