@@ -493,6 +493,11 @@ Path("rerank-log.json").write_text(
 
 `response["detail"]` records effective settings, Python/dependency versions, requested/resolved models, tokenizer revision, usage, retries, splits, submitted state/questions, and responses. Per-result `detail` contains `original_length`, `sent_length`, `length_unit`, related request IDs, and pairwise comparisons. `rerank(..., detail=True)` and `relevance_rerank(..., detail=True)` return the same full execution record, including excluded documents.
 
+For split listwise calls, the ordering of entries in `detail["splits"]` and the
+assignment of request IDs in `detail["requests"]` and `documents[*]["request_ids"]`
+depend on task/thread timing and are not deterministic between identical runs.
+This does not affect final scores or stable tie ordering.
+
 For the built-in listwise relevance preset, `detail["configuration"]["instructions"]`
 contains the full rule template. In each entry of `detail["requests"]`, inspect
 `payload["state"]["rubric"]` together with `payload["questions"]` to see the complete

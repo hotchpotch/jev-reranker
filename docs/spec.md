@@ -73,7 +73,9 @@ An instance-wide concurrency limiter coordinates requests across threads and loo
 using a lock and awaitable futures. Cancellation removes waiters or releases their
 assigned permits without leaking capacity. Retry waits retain their request slot.
 Pointwise uses bounded worker tasks; pairwise processes bounded groups of pairs.
-Listwise chunks run sequentially. Move tokenizer loading and counting to
+Listwise split groups run concurrently within the instance-wide HTTP limit,
+including groups created after a provider context-limit rejection.
+Move tokenizer loading and counting to
 `asyncio.to_thread`, retaining the instance tokenizer lock.
 
 Injected `client` and `transport` are advanced, caller-owned resources and are
@@ -131,7 +133,7 @@ Key precedence: explicit `api_key` → actual environment variable named by `api
 
 Model precedence: explicit model → `JEV_MODEL` in environment/`.env` → `jev-latest`. Endpoint precedence: explicit endpoint → `TYPESAFE_ENDPOINT` → `https://api.typesafe.ai/v1/systemone`. Require an absolute HTTPS URL, allowing local HTTP for tests. Reject URL credentials, query strings, and fragments. Do not follow redirects.
 
-Default `max_concurrency` is 4 for listwise and 20 for pointwise/pairwise, shared across the instance. Listwise chunks remain sequential. The 180-second timeout applies to each HTTP I/O, not the entire ranking call.
+Default `max_concurrency` is 4 for listwise and 20 for pointwise/pairwise, shared across the instance. Listwise split groups run concurrently within this instance-wide HTTP limit. The 180-second timeout applies to each HTTP I/O, not the entire ranking call.
 
 ## Errors and retries
 
@@ -142,6 +144,11 @@ Public exceptions derive from `JevError`: `ConfigurationError`, `APIError` (with
 ## Details and reproducibility
 
 Detail schema version 2 records UTC start time, elapsed seconds, package/Python/platform/dependency versions, endpoint, requested/resolved model, mode, effective instructions/criteria, tokenizer/revision/budgets, timeout/retry/concurrency settings, query/document hashes, original/sent lengths and units, split traces, per-request questions/state/responses/attempts/waits/usage, and aggregate usage. Record `configuration.length_function`, `length_unit`, and request `estimated_length`. API token usage is measured by the service and is distinct from local estimates. Pairwise details include opponent indices and directional judgments.
+
+For split listwise calls, the ordering of entries in `detail["splits"]` and the
+assignment of request IDs in `detail["requests"]` and `documents[*]["request_ids"]`
+depend on task/thread timing and are not deterministic between identical runs.
+This does not affect final scores or stable tie ordering.
 
 Do not collect API keys, authentication headers, arbitrary environment variables, or hostnames. Details contain query and document text, so callers control storage and sharing. The library does not write files automatically; callers can use `json.dump(response, ...)`.
 
