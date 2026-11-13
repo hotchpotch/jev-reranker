@@ -836,6 +836,7 @@ class JevReranker:
                 estimate=estimate_group,
                 request=request_group,
                 splits=run.splits,
+                gather=_gather_cancel_on_error,
             )
         scores = [0.0] * len(docs)
         if self.mode == "pointwise":

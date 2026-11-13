@@ -36,6 +36,7 @@ async def score_listwise(
     estimate: Callable[[list[int]], Awaitable[dict[str, int]]],
     request: Callable[[list[int]], Awaitable[list[float]]],
     splits: list[dict[str, Any]],
+    gather: Callable[..., Awaitable[list[Any]]],
 ) -> list[float]:
     scores = [0.0] * len(lengths)
     query_hash = hashlib.sha256(query.encode()).hexdigest()
@@ -82,8 +83,7 @@ async def score_listwise(
                 "chunks": chunks,
             }
         )
-        for chunk in chunks:
-            await score(chunk, depth + 1, sb, rb)
+        await gather(*(score(chunk, depth + 1, sb, rb) for chunk in chunks))
 
     async def score(indices: list[int], depth: int, sb: int, rb: int) -> None:
         if not fits(await estimate(indices), sb, rb):
