@@ -64,13 +64,13 @@ deps = pytest
 commands = pytest tests examples/eval.py {posargs}
 
 [testenv:lint]
-deps = ruff
+runner = uv-venv-lock-runner
+dependency_groups = dev
 commands = ruff check .
 
 [testenv:type]
-deps =
-    ty
-    pytest
+runner = uv-venv-lock-runner
+dependency_groups = dev
 commands = ty check
 """
 
