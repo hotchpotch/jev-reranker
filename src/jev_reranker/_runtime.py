@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Callable, Coroutine
+from collections.abc import AsyncGenerator, Callable, Coroutine
 from concurrent.futures import Future
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
@@ -116,7 +116,7 @@ class Runtime:
                 self.loop = current
 
     @asynccontextmanager
-    async def operation(self) -> AsyncIterator[None]:
+    async def operation(self) -> AsyncGenerator[None, None]:
         with self._condition:
             self.bind()
             self._active += 1
