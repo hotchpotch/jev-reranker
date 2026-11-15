@@ -348,7 +348,7 @@ Each call owns a separate, lazily created HTTP client. Success, failure, and
 cancellation all close it before the call finishes. A context-local call state
 keeps concurrent requests separate. No explicit shutdown is needed for normal use.
 
-HTTP concurrency is bounded across the entire instance. Pointwise uses worker tasks, pairwise processes bounded groups of tasks, and listwise chunks run sequentially. Retries use `asyncio.sleep`. Synchronous tokenizer loading and counting use `asyncio.to_thread`.
+HTTP concurrency is bounded across the entire instance. Pointwise uses worker tasks, pairwise processes bounded groups of tasks, and listwise split groups run concurrently through the same HTTP limit. Retries use `asyncio.sleep`. Synchronous tokenizer loading and counting use `asyncio.to_thread`.
 
 Cancellation drains child tasks before propagating `asyncio.CancelledError`. HTTP failures also drain children and preserve public `JevError` exceptions rather than wrapping them in `ExceptionGroup`. `aclose()` and `close()` remain optional compatibility methods: they reject new work and wait for active calls, whose resources are cleaned up automatically. Cancel caller tasks first if you need to stop active work early.
 
@@ -492,6 +492,11 @@ Path("rerank-log.json").write_text(
 ```
 
 `response["detail"]` records effective settings, Python/dependency versions, requested/resolved models, tokenizer revision, usage, retries, splits, submitted state/questions, and responses. Per-result `detail` contains `original_length`, `sent_length`, `length_unit`, related request IDs, and pairwise comparisons. `rerank(..., detail=True)` and `relevance_rerank(..., detail=True)` return the same full execution record, including excluded documents.
+
+For split listwise calls, the ordering of entries in `detail["splits"]` and the
+assignment of request IDs in `detail["requests"]` and `documents[*]["request_ids"]`
+depend on task/thread timing and are not deterministic between identical runs.
+This does not affect final scores or stable tie ordering.
 
 For the built-in listwise relevance preset, `detail["configuration"]["instructions"]`
 contains the full rule template. In each entry of `detail["requests"]`, inspect
